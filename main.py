@@ -88,7 +88,7 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
     # Probe audio duration
     audio_duration = get_audio_duration_seconds(audio_path)
 
-    # ffmpeg command:
+        # ffmpeg command:
     # - loop video infinitely
     # - re-encode video
     # - stop output exactly at audio length
@@ -96,16 +96,26 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
         "ffmpeg", "-y",
         "-stream_loop", "-1", "-i", video_path,
         "-i", audio_path,
-        "-t", f"{audio_duration:.3f}",
+        "-filter_complex",
+        (
+            "[0:a]volume=0.25[a0];"
+            "[a0][1:a]amix=inputs=2:weights=1 3:dropout_transition=0[a]"
+        ),
         "-map", "0:v:0",
-        "-map", "1:a:0",
+        "-map", "[a]",
+        "-t", f"{audio_duration:.3f}",
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-pix_fmt", "yuv420p",
+        "-profile:v", "high",
+        "-level", "4.1",
         "-c:a", "aac",
+        "-b:a", "192k",
         "-movflags", "+faststart",
         output_path
     ]
+
+
 
     try:
         subprocess.run(
