@@ -3,11 +3,11 @@ import uuid
 import shutil
 import tempfile
 import subprocess
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel, HttpUrl
 
 app = FastAPI()
@@ -19,10 +19,17 @@ DOWNLOAD_TIMEOUT = 120          # seconds per file download
 FFMPEG_TIMEOUT = 900            # seconds (15 minutes)
 MAX_BYTES = 300 * 1024 * 1024   # 300MB safety limit
 
+# ----------------------------
+# Request models
+# ----------------------------
+class SrtRequest(BaseModel):
+    # pass the parsed STT JSON (as a dict)
+    stt: Dict[str, Any]
+    # optional formatting controls
+    words_per_caption: int = 6
+    max_line_chars: int = 42
 
-# ----------------------------
-# Request model
-# ----------------------------
+
 class MuxRequest(BaseModel):
     video_url: HttpUrl
     audio_url: HttpUrl
@@ -58,11 +65,7 @@ def get_audio_duration_seconds(path: str) -> float:
         path
     ]
     try:
-        output = subprocess.check_output(
-            cmd,
-            stderr=subprocess.STDOUT,
-            timeout=30
-        ).decode().strip()
+        output = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=30).decode().strip()
         duration = float(output)
         if duration <= 0:
             raise ValueError("Invalid duration")
@@ -71,9 +74,106 @@ def get_audio_duration_seconds(path: str) -> float:
         raise HTTPException(status_code=500, detail=f"ffprobe failed: {e}")
 
 
+def srt_timestamp(seconds: float) -> str:
+    if seconds < 0:
+        seconds = 0.0
+    ms = int(round(seconds * 1000))
+    hh = ms // 3600000
+    ms -= hh * 3600000
+    mm = ms // 60000
+    ms -= mm * 60000
+    ss = ms // 1000
+    ms -= ss * 1000
+    return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
+
+
+def normalize_words(stt: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    ElevenLabs STT often includes entries of type 'word' and type 'spacing'.
+    We only want type == 'word' (and anything else that has start/end).
+    """
+    words = stt.get("words") or stt.get("data", {}).get("words") or []
+    out = []
+    for w in words:
+        if not isinstance(w, dict):
+            continue
+        wtype = w.get("type")
+        if wtype == "spacing":
+            continue
+        if "start" in w and "end" in w and "text" in w:
+            # keep actual words; ignore pure whitespace tokens
+            txt = w.get("text", "")
+            if txt.strip() == "":
+                continue
+            out.append({"text": txt, "start": float(w["start"]), "end": float(w["end"])})
+    return out
+
+
+def build_srt_from_words(
+    words: List[Dict[str, Any]],
+    words_per_caption: int = 6,
+    max_line_chars: int = 42
+) -> str:
+    """
+    Simple, robust captioning:
+    - groups every N words into a caption
+    - uses start time of first word and end time of last word
+    - wraps into up to 2 lines based on max_line_chars
+    """
+    if not words:
+        return ""
+
+    captions = []
+    idx = 1
+    for i in range(0, len(words), words_per_caption):
+        chunk = words[i:i + words_per_caption]
+        start = chunk[0]["start"]
+        end = chunk[-1]["end"]
+        text = " ".join(w["text"] for w in chunk).strip()
+
+        # wrap into up to 2 lines
+        if len(text) > max_line_chars:
+            # find a split near the middle
+            mid = len(text) // 2
+            split = text.rfind(" ", 0, mid)
+            if split == -1:
+                split = text.find(" ", mid)
+            if split != -1:
+                line1 = text[:split].strip()
+                line2 = text[split + 1:].strip()
+                text = f"{line1}\n{line2}"
+
+        captions.append(
+            f"{idx}\n"
+            f"{srt_timestamp(start)} --> {srt_timestamp(end)}\n"
+            f"{text}\n"
+        )
+        idx += 1
+
+    return "\n".join(captions).strip() + "\n"
+
+
 # ----------------------------
-# Endpoint
+# Endpoints
 # ----------------------------
+@app.post("/srt", response_class=PlainTextResponse)
+def srt(req: SrtRequest):
+    try:
+        words = normalize_words(req.stt)
+        srt_text = build_srt_from_words(
+            words,
+            words_per_caption=max(2, int(req.words_per_caption)),
+            max_line_chars=max(20, int(req.max_line_chars)),
+        )
+        if not srt_text.strip():
+            raise HTTPException(status_code=400, detail="No words found in STT payload")
+        return srt_text
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"SRT build failed: {e}")
+
+
 @app.post("/mux")
 def mux(request: MuxRequest, background_tasks: BackgroundTasks):
     job_id = uuid.uuid4().hex
@@ -81,38 +181,44 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
 
     video_path = os.path.join(tmpdir, "video.mp4")
     audio_path = os.path.join(tmpdir, "audio.mp3")
-    output_path = os.path.join(tmpdir, "output.mp4")
     subs_path = os.path.join(tmpdir, "subs.srt")
+    output_path = os.path.join(tmpdir, "output.mp4")
 
-    # ----------------------------
     # Download inputs
-    # ----------------------------
     download_file(str(request.video_url), video_path)
     download_file(str(request.audio_url), audio_path)
 
-    has_subtitles = request.subtitles_url is not None
-    if has_subtitles:
+    if request.subtitles_url:
         download_file(str(request.subtitles_url), subs_path)
+        have_subs = True
+    else:
+        have_subs = False
 
-    # ----------------------------
     # Probe audio duration
-    # ----------------------------
     audio_duration = get_audio_duration_seconds(audio_path)
 
-    # ----------------------------
-    # Build FFmpeg command
-    # ----------------------------
+    # Video filter
+    # Note: subtitles filter uses libass; should work with .srt
+    vf = []
+    if have_subs:
+        # Basic, readable style (you can tweak later)
+        vf.append(f"subtitles={subs_path}")
+
+    vf_arg = ",".join(vf) if vf else None
+
+    # ffmpeg command:
+    # - loop video infinitely
+    # - mix audio: (optional) bed track on input 0 audio at low volume + generated audio on input 1
+    #   (your current video likely has no useful audio, but we keep your pattern)
+    # - stop output exactly at audio length
     ffmpeg_cmd = [
         "ffmpeg", "-y",
         "-stream_loop", "-1", "-i", video_path,
         "-i", audio_path,
     ]
 
-    # Optional subtitle burn-in
-    if has_subtitles:
-        ffmpeg_cmd += [
-            "-vf", f"subtitles={subs_path}"
-        ]
+    if vf_arg:
+        ffmpeg_cmd += ["-vf", vf_arg]
 
     ffmpeg_cmd += [
         "-filter_complex",
@@ -134,9 +240,6 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
         output_path
     ]
 
-    # ----------------------------
-    # Run FFmpeg
-    # ----------------------------
     try:
         subprocess.run(
             ffmpeg_cmd,
@@ -150,11 +253,9 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=500, detail=f"ffmpeg failed: {error_tail}")
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=504, detail="ffmpeg timed out")
-
-    # ----------------------------
-    # Cleanup AFTER response
-    # ----------------------------
-    background_tasks.add_task(shutil.rmtree, tmpdir, True)
+    finally:
+        # Cleanup AFTER response is sent
+        background_tasks.add_task(shutil.rmtree, tmpdir, True)
 
     return FileResponse(
         output_path,
