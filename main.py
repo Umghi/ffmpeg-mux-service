@@ -3,6 +3,7 @@ import uuid
 import shutil
 import tempfile
 import subprocess
+from typing import Optional
 
 import requests
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -25,6 +26,7 @@ MAX_BYTES = 300 * 1024 * 1024   # 300MB safety limit
 class MuxRequest(BaseModel):
     video_url: HttpUrl
     audio_url: HttpUrl
+    subtitles_url: Optional[HttpUrl] = None
 
 
 # ----------------------------
@@ -80,22 +82,39 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
     video_path = os.path.join(tmpdir, "video.mp4")
     audio_path = os.path.join(tmpdir, "audio.mp3")
     output_path = os.path.join(tmpdir, "output.mp4")
+    subs_path = os.path.join(tmpdir, "subs.srt")
 
+    # ----------------------------
     # Download inputs
+    # ----------------------------
     download_file(str(request.video_url), video_path)
     download_file(str(request.audio_url), audio_path)
 
+    has_subtitles = request.subtitles_url is not None
+    if has_subtitles:
+        download_file(str(request.subtitles_url), subs_path)
+
+    # ----------------------------
     # Probe audio duration
+    # ----------------------------
     audio_duration = get_audio_duration_seconds(audio_path)
 
-        # ffmpeg command:
-    # - loop video infinitely
-    # - re-encode video
-    # - stop output exactly at audio length
+    # ----------------------------
+    # Build FFmpeg command
+    # ----------------------------
     ffmpeg_cmd = [
         "ffmpeg", "-y",
         "-stream_loop", "-1", "-i", video_path,
         "-i", audio_path,
+    ]
+
+    # Optional subtitle burn-in
+    if has_subtitles:
+        ffmpeg_cmd += [
+            "-vf", f"subtitles={subs_path}"
+        ]
+
+    ffmpeg_cmd += [
         "-filter_complex",
         (
             "[0:a]volume=0.25[a0];"
@@ -115,8 +134,9 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
         output_path
     ]
 
-
-
+    # ----------------------------
+    # Run FFmpeg
+    # ----------------------------
     try:
         subprocess.run(
             ffmpeg_cmd,
@@ -131,8 +151,9 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=504, detail="ffmpeg timed out")
 
-    # IMPORTANT:
-    # Cleanup must happen AFTER the response is fully sent
+    # ----------------------------
+    # Cleanup AFTER response
+    # ----------------------------
     background_tasks.add_task(shutil.rmtree, tmpdir, True)
 
     return FileResponse(
