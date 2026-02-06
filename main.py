@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import PlainTextResponse, FileResponse
 from pydantic import BaseModel, HttpUrl
 
 app = FastAPI()
@@ -16,20 +16,13 @@ app = FastAPI()
 # Config
 # ----------------------------
 DOWNLOAD_TIMEOUT = 120          # seconds per file download
-FFMPEG_TIMEOUT = 900            # seconds (15 minutes)
+FFMPEG_TIMEOUT = 900            # seconds
 MAX_BYTES = 300 * 1024 * 1024   # 300MB safety limit
+
 
 # ----------------------------
 # Request models
 # ----------------------------
-class SrtRequest(BaseModel):
-    # pass the parsed STT JSON (as a dict)
-    stt: Dict[str, Any]
-    # optional formatting controls
-    words_per_caption: int = 6
-    max_line_chars: int = 42
-
-
 class MuxRequest(BaseModel):
     video_url: HttpUrl
     audio_url: HttpUrl
@@ -39,19 +32,42 @@ class MuxRequest(BaseModel):
 # ----------------------------
 # Helpers
 # ----------------------------
+def _looks_like_html(first_bytes: bytes) -> bool:
+    # crude but very effective for Dropbox/redirect issues
+    s = first_bytes.lstrip().lower()
+    return s.startswith(b"<!doctype html") or s.startswith(b"<html") or b"<head" in s[:2000]
+
+
 def download_file(url: str, dest_path: str) -> None:
     try:
         with requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT, allow_redirects=True) as r:
             r.raise_for_status()
+
             total = 0
+            first_chunk = b""
+            wrote_any = False
+
             with open(dest_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1024 * 1024):
                     if not chunk:
                         continue
+                    if not wrote_any:
+                        first_chunk = chunk[:4096]
+                        wrote_any = True
+                        if _looks_like_html(first_chunk):
+                            raise HTTPException(
+                                status_code=400,
+                                detail="Downloaded HTML instead of a media file. (Check Dropbox link is direct: dl=1 or use temporary link.)"
+                            )
+
                     total += len(chunk)
                     if total > MAX_BYTES:
                         raise HTTPException(status_code=413, detail="File too large")
                     f.write(chunk)
+
+            if not wrote_any:
+                raise HTTPException(status_code=400, detail="Downloaded file is empty")
+
     except requests.RequestException as e:
         raise HTTPException(status_code=400, detail=f"Download failed: {e}")
 
@@ -66,6 +82,8 @@ def get_audio_duration_seconds(path: str) -> float:
     ]
     try:
         output = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=30).decode().strip()
+        if output in ("", "N/A"):
+            raise ValueError(f"ffprobe duration unavailable: '{output}'")
         duration = float(output)
         if duration <= 0:
             raise ValueError("Invalid duration")
@@ -76,7 +94,7 @@ def get_audio_duration_seconds(path: str) -> float:
 
 def srt_timestamp(seconds: float) -> str:
     if seconds < 0:
-        seconds = 0.0
+        seconds = 0
     ms = int(round(seconds * 1000))
     hh = ms // 3600000
     ms -= hh * 3600000
@@ -87,91 +105,112 @@ def srt_timestamp(seconds: float) -> str:
     return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
 
 
-def normalize_words(stt: Dict[str, Any]) -> List[Dict[str, Any]]:
+def words_to_captions(words: List[Dict[str, Any]],
+                      max_chars: int = 38,
+                      max_words: int = 7,
+                      max_duration: float = 2.2,
+                      min_duration: float = 0.35) -> List[Dict[str, Any]]:
     """
-    ElevenLabs STT often includes entries of type 'word' and type 'spacing'.
-    We only want type == 'word' (and anything else that has start/end).
+    Turns ElevenLabs word timestamps into readable short-form captions.
+    - max_chars per caption line (approx)
+    - max_words per caption
+    - max_duration (seconds) per caption chunk
     """
-    words = stt.get("words") or stt.get("data", {}).get("words") or []
-    out = []
-    for w in words:
-        if not isinstance(w, dict):
+    # Filter only actual words (drop spacing tokens)
+    w = [x for x in words if x.get("type") == "word" and str(x.get("text", "")).strip()]
+
+    caps = []
+    buf = []
+    start = None
+    last_end = None
+
+    def flush():
+        nonlocal buf, start, last_end
+        if not buf or start is None or last_end is None:
+            buf = []
+            start = None
+            last_end = None
+            return
+        text = " ".join(buf).strip()
+        # enforce 1–2 line-ish by trimming length; simplest approach is keep max chars target
+        caps.append({
+            "start": float(start),
+            "end": float(last_end),
+            "text": text
+        })
+        buf = []
+        start = None
+        last_end = None
+
+    for item in w:
+        t = str(item.get("text", "")).strip()
+        s = float(item.get("start", 0.0))
+        e = float(item.get("end", s))
+
+        if start is None:
+            start = s
+
+        proposed = (" ".join(buf + [t])).strip()
+        dur = e - start
+
+        # chunking rules
+        if (len(buf) >= max_words) or (len(proposed) > max_chars) or (dur > max_duration):
+            flush()
+            start = s
+            buf.append(t)
+            last_end = e
             continue
-        wtype = w.get("type")
-        if wtype == "spacing":
-            continue
-        if "start" in w and "end" in w and "text" in w:
-            # keep actual words; ignore pure whitespace tokens
-            txt = w.get("text", "")
-            if txt.strip() == "":
-                continue
-            out.append({"text": txt, "start": float(w["start"]), "end": float(w["end"])})
-    return out
+
+        buf.append(t)
+        last_end = e
+
+        # if we have a long pause between words, flush
+        if last_end is not None and (s - last_end) > 0.6:
+            flush()
+
+    flush()
+
+    # ensure minimum duration
+    for c in caps:
+        if (c["end"] - c["start"]) < min_duration:
+            c["end"] = c["start"] + min_duration
+
+    return caps
 
 
-def build_srt_from_words(
-    words: List[Dict[str, Any]],
-    words_per_caption: int = 6,
-    max_line_chars: int = 42
-) -> str:
-    """
-    Simple, robust captioning:
-    - groups every N words into a caption
-    - uses start time of first word and end time of last word
-    - wraps into up to 2 lines based on max_line_chars
-    """
-    if not words:
-        return ""
-
-    captions = []
-    idx = 1
-    for i in range(0, len(words), words_per_caption):
-        chunk = words[i:i + words_per_caption]
-        start = chunk[0]["start"]
-        end = chunk[-1]["end"]
-        text = " ".join(w["text"] for w in chunk).strip()
-
-        # wrap into up to 2 lines
-        if len(text) > max_line_chars:
-            # find a split near the middle
-            mid = len(text) // 2
-            split = text.rfind(" ", 0, mid)
-            if split == -1:
-                split = text.find(" ", mid)
-            if split != -1:
-                line1 = text[:split].strip()
-                line2 = text[split + 1:].strip()
-                text = f"{line1}\n{line2}"
-
-        captions.append(
-            f"{idx}\n"
-            f"{srt_timestamp(start)} --> {srt_timestamp(end)}\n"
-            f"{text}\n"
-        )
-        idx += 1
-
-    return "\n".join(captions).strip() + "\n"
+def captions_to_srt(captions: List[Dict[str, Any]]) -> str:
+    lines = []
+    for idx, c in enumerate(captions, start=1):
+        lines.append(str(idx))
+        lines.append(f"{srt_timestamp(c['start'])} --> {srt_timestamp(c['end'])}")
+        lines.append(c["text"])
+        lines.append("")  # blank line
+    return "\n".join(lines).strip() + "\n"
 
 
 # ----------------------------
 # Endpoints
 # ----------------------------
 @app.post("/srt", response_class=PlainTextResponse)
-def srt(req: SrtRequest):
+def srt_from_stt(payload: Dict[str, Any]):
+    """
+    Accepts ElevenLabs STT JSON payload.
+    Expected to contain: payload["data"]["words"].
+    Returns SRT text.
+    """
     try:
-        words = normalize_words(req.stt)
-        srt_text = build_srt_from_words(
-            words,
-            words_per_caption=max(2, int(req.words_per_caption)),
-            max_line_chars=max(20, int(req.max_line_chars)),
-        )
-        if not srt_text.strip():
-            raise HTTPException(status_code=400, detail="No words found in STT payload")
-        return srt_text
+        data = payload.get("data") or {}
+        words = data.get("words") or []
+        if not isinstance(words, list) or len(words) == 0:
+            raise HTTPException(status_code=400, detail="STT payload missing data.words[]")
+
+        captions = words_to_captions(words)
+        srt = captions_to_srt(captions)
+        return PlainTextResponse(content=srt, media_type="text/plain")
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"SRT build failed: {e}")
+        raise HTTPException(status_code=500, detail=f"SRT generation failed: {e}")
 
 
 @app.post("/mux")
@@ -181,7 +220,7 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
 
     video_path = os.path.join(tmpdir, "video.mp4")
     audio_path = os.path.join(tmpdir, "audio.mp3")
-    subs_path = os.path.join(tmpdir, "subs.srt")
+    subs_path  = os.path.join(tmpdir, "subs.srt")
     output_path = os.path.join(tmpdir, "output.mp4")
 
     # Download inputs
@@ -190,44 +229,27 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
 
     if request.subtitles_url:
         download_file(str(request.subtitles_url), subs_path)
-        have_subs = True
-    else:
-        have_subs = False
 
     # Probe audio duration
     audio_duration = get_audio_duration_seconds(audio_path)
 
-    # Video filter
-    # Note: subtitles filter uses libass; should work with .srt
+    # Build FFmpeg command
+    # - loop video infinitely
+    # - stop exactly at audio length
+    # - burn subtitles if provided
     vf = []
-    if have_subs:
-        # Basic, readable style (you can tweak later)
+    if request.subtitles_url:
+        # subtitle filter reads local file; escape needed for some paths; tempdir is safe
         vf.append(f"subtitles={subs_path}")
 
     vf_arg = ",".join(vf) if vf else None
 
-    # ffmpeg command:
-    # - loop video infinitely
-    # - mix audio: (optional) bed track on input 0 audio at low volume + generated audio on input 1
-    #   (your current video likely has no useful audio, but we keep your pattern)
-    # - stop output exactly at audio length
     ffmpeg_cmd = [
         "ffmpeg", "-y",
         "-stream_loop", "-1", "-i", video_path,
         "-i", audio_path,
-    ]
-
-    if vf_arg:
-        ffmpeg_cmd += ["-vf", vf_arg]
-
-    ffmpeg_cmd += [
-        "-filter_complex",
-        (
-            "[0:a]volume=0.25[a0];"
-            "[a0][1:a]amix=inputs=2:weights=1 3:dropout_transition=0[a]"
-        ),
         "-map", "0:v:0",
-        "-map", "[a]",
+        "-map", "1:a:0",
         "-t", f"{audio_duration:.3f}",
         "-c:v", "libx264",
         "-preset", "veryfast",
@@ -237,8 +259,12 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
         "-c:a", "aac",
         "-b:a", "192k",
         "-movflags", "+faststart",
-        output_path
     ]
+
+    if vf_arg:
+        ffmpeg_cmd += ["-vf", vf_arg]
+
+    ffmpeg_cmd.append(output_path)
 
     try:
         subprocess.run(
@@ -254,7 +280,7 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=504, detail="ffmpeg timed out")
     finally:
-        # Cleanup AFTER response is sent
+        # Cleanup AFTER response fully sent
         background_tasks.add_task(shutil.rmtree, tmpdir, True)
 
     return FileResponse(
