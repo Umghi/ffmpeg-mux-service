@@ -102,14 +102,16 @@ def srt_timestamp(seconds: float) -> str:
     ms -= mm * 60000
     ss = ms // 1000
     ms -= ss * 1000
-    return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
+    return f"{hh:02d}:{mm:02d}:{ss:03d},{ms:03d}"
 
 
-def words_to_captions(words: List[Dict[str, Any]],
-                      max_chars: int = 38,
-                      max_words: int = 7,
-                      max_duration: float = 2.2,
-                      min_duration: float = 0.35) -> List[Dict[str, Any]]:
+def words_to_captions(
+    words: List[Dict[str, Any]],
+    max_chars: int = 38,
+    max_words: int = 7,
+    max_duration: float = 2.2,
+    min_duration: float = 0.35
+) -> List[Dict[str, Any]]:
     """
     Turns ElevenLabs word timestamps into readable short-form captions.
     - max_chars per caption line (approx)
@@ -119,12 +121,12 @@ def words_to_captions(words: List[Dict[str, Any]],
     # Filter only actual words (drop spacing tokens)
     w = [x for x in words if x.get("type") == "word" and str(x.get("text", "")).strip()]
 
-    caps = []
-    buf = []
-    start = None
-    last_end = None
+    caps: List[Dict[str, Any]] = []
+    buf: List[str] = []
+    start: Optional[float] = None
+    last_end: Optional[float] = None
 
-    def flush():
+    def flush() -> None:
         nonlocal buf, start, last_end
         if not buf or start is None or last_end is None:
             buf = []
@@ -132,12 +134,13 @@ def words_to_captions(words: List[Dict[str, Any]],
             last_end = None
             return
         text = " ".join(buf).strip()
-        # enforce 1–2 line-ish by trimming length; simplest approach is keep max chars target
-        caps.append({
-            "start": float(start),
-            "end": float(last_end),
-            "text": text
-        })
+        caps.append(
+            {
+                "start": float(start),
+                "end": float(last_end),
+                "text": text,
+            }
+        )
         buf = []
         start = None
         last_end = None
@@ -179,7 +182,7 @@ def words_to_captions(words: List[Dict[str, Any]],
 
 
 def captions_to_srt(captions: List[Dict[str, Any]]) -> str:
-    lines = []
+    lines: List[str] = []
     for idx, c in enumerate(captions, start=1):
         lines.append(str(idx))
         lines.append(f"{srt_timestamp(c['start'])} --> {srt_timestamp(c['end'])}")
@@ -191,18 +194,55 @@ def captions_to_srt(captions: List[Dict[str, Any]]) -> str:
 # ----------------------------
 # Endpoints
 # ----------------------------
-@app.post("/srt", response_class=PlainTextResponse)
-def srt_from_stt(payload: Dict[str, Any]):
+def _extract_words_from_payload(payload: Any) -> List[Dict[str, Any]]:
     """
-    Accepts ElevenLabs STT JSON payload.
-    Expected to contain: payload["data"]["words"].
-    Returns SRT text.
+    Support multiple shapes of STT JSON:
+    1) {"data": {"words": [...] , ...}}
+    2) {"words": [...], ...}
+    3) [ {...}, ... ] with either of the above inside the first element
+    """
+    # Direct dict
+    if isinstance(payload, dict):
+        # Preferred: wrapped in "data"
+        data = payload.get("data")
+        if isinstance(data, dict) and isinstance(data.get("words"), list):
+            return data["words"]
+        # Flattened: words at root
+        if isinstance(payload.get("words"), list):
+            return payload["words"]
+
+    # List of one or more entries (defensive)
+    if isinstance(payload, list) and payload:
+        first = payload[0]
+        if isinstance(first, dict):
+            data = first.get("data")
+            if isinstance(data, dict) and isinstance(data.get("words"), list):
+                return data["words"]
+            if isinstance(first.get("words"), list):
+                return first["words"]
+
+    return []
+
+
+@app.post("/srt", response_class=PlainTextResponse)
+def srt_from_stt(payload: Any):
+    """
+    Accepts STT JSON payload and converts it to SRT.
+
+    Supported payload shapes:
+    - {"data": {"words": [...], ...}}
+    - {"words": [...], ...}
     """
     try:
-        data = payload.get("data") or {}
-        words = data.get("words") or []
-        if not isinstance(words, list) or len(words) == 0:
-            raise HTTPException(status_code=400, detail="STT payload missing data.words[]")
+        words = _extract_words_from_payload(payload)
+        if not isinstance(words, list) or not words:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "STT payload missing words[]. "
+                    "Expected either payload['data']['words'] or payload['words']."
+                ),
+            )
 
         captions = words_to_captions(words)
         srt = captions_to_srt(captions)
@@ -220,7 +260,7 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
 
     video_path = os.path.join(tmpdir, "video.mp4")
     audio_path = os.path.join(tmpdir, "audio.mp3")
-    subs_path  = os.path.join(tmpdir, "subs.srt")
+    subs_path = os.path.join(tmpdir, "subs.srt")
     output_path = os.path.join(tmpdir, "output.mp4")
 
     # Download inputs
@@ -237,28 +277,43 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
     # - loop video infinitely
     # - stop exactly at audio length
     # - burn subtitles if provided
-    vf = []
+    vf: List[str] = []
     if request.subtitles_url:
-        # subtitle filter reads local file; escape needed for some paths; tempdir is safe
         vf.append(f"subtitles={subs_path}")
 
     vf_arg = ",".join(vf) if vf else None
 
     ffmpeg_cmd = [
-        "ffmpeg", "-y",
-        "-stream_loop", "-1", "-i", video_path,
-        "-i", audio_path,
-        "-map", "0:v:0",
-        "-map", "1:a:0",
-        "-t", f"{audio_duration:.3f}",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-pix_fmt", "yuv420p",
-        "-profile:v", "high",
-        "-level", "4.1",
-        "-c:a", "aac",
-        "-b:a", "192k",
-        "-movflags", "+faststart",
+        "ffmpeg",
+        "-y",
+        "-stream_loop",
+        "-1",
+        "-i",
+        video_path,
+        "-i",
+        audio_path,
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-t",
+        f"{audio_duration:.3f}",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-pix_fmt",
+        "yuv420p",
+        "-profile:v",
+        "high",
+        "-level",
+        "4.1",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-movflags",
+        "+faststart",
     ]
 
     if vf_arg:
@@ -272,7 +327,7 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=FFMPEG_TIMEOUT
+            timeout=FFMPEG_TIMEOUT,
         )
     except subprocess.CalledProcessError as e:
         error_tail = e.stderr.decode(errors="ignore")[-4000:]
@@ -280,11 +335,10 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=504, detail="ffmpeg timed out")
     finally:
-        # Cleanup AFTER response fully sent
         background_tasks.add_task(shutil.rmtree, tmpdir, True)
 
     return FileResponse(
         output_path,
         media_type="video/mp4",
-        filename=f"final_{job_id}.mp4"
+        filename=f"final_{job_id}.mp4",
     )
