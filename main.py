@@ -4,6 +4,7 @@ import shutil
 import tempfile
 import subprocess
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse  # NEW
 
 import requests
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Body
@@ -45,10 +46,36 @@ def _looks_like_html(first_bytes: bytes) -> bool:
     )
 
 
+def _normalize_dropbox_url(url: str) -> str:
+    """
+    Make Dropbox share links behave like direct-download links.
+
+    - Ensures ?dl=1 is present (or replaces dl=0 with dl=1)
+    - Works for .../s/..., .../scl/fi/..., etc.
+    """
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+
+    if "dropbox.com" not in host:
+        return url
+
+    # Parse existing query params, force dl=1
+    qs = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    qs["dl"] = "1"
+
+    new_query = urlencode(qs)
+    normalized = urlunparse(parsed._replace(query=new_query))
+    return normalized
+
+
 def download_file(url: str, dest_path: str) -> None:
     """
     Stream-download a file to dest_path with size and HTML checks.
+    Automatically normalizes Dropbox URLs to direct-download links.
     """
+    # NEW: normalize Dropbox share URLs
+    url = _normalize_dropbox_url(url)
+
     try:
         with requests.get(
             url,
@@ -70,12 +97,14 @@ def download_file(url: str, dest_path: str) -> None:
                     if not wrote_any:
                         first_chunk = chunk[:4096]
                         wrote_any = True
+
+                        # If it's still HTML after normalization, bail.
                         if _looks_like_html(first_chunk):
                             raise HTTPException(
                                 status_code=400,
                                 detail=(
                                     "Downloaded HTML instead of a media file. "
-                                    "(Check Dropbox link is direct: dl=1 or use temporary link.)"
+                                    "If this is a Dropbox link, ensure it is a direct or temporary link."
                                 ),
                             )
 
@@ -157,11 +186,6 @@ def words_to_captions(
 ) -> List[Dict[str, Any]]:
     """
     Turns word-level timestamps into short caption chunks.
-
-    - max_chars: approximate max characters per caption
-    - max_words: max words per caption
-    - max_duration: max caption duration in seconds
-    - min_duration: minimum duration to avoid instant-flash captions
     """
     # Filter only actual words (drop spacing tokens)
     w = [
@@ -269,7 +293,7 @@ def _extract_words_from_payload(payload: Any) -> List[Dict[str, Any]]:
         if isinstance(payload.get("words"), list):
             return payload["words"]
 
-    # List of bundles (defensive, e.g. some webhook styles)
+    # List of bundles (defensive)
     if isinstance(payload, list) and payload:
         first = payload[0]
         if isinstance(first, dict):
@@ -289,11 +313,6 @@ def _extract_words_from_payload(payload: Any) -> List[Dict[str, Any]]:
 def srt_from_stt(payload: Any = Body(...)):
     """
     Accepts STT JSON payload and returns SRT text.
-
-    Supported payload shapes:
-    - {"data": {"words": [...], ...}}
-    - {"words": [...], ...}
-    - Or a list containing such an object as the first element.
     """
     try:
         words = _extract_words_from_payload(payload)
@@ -330,7 +349,7 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
     subs_path = os.path.join(tmpdir, "subs.srt")
     output_path = os.path.join(tmpdir, "output.mp4")
 
-    # Download inputs
+    # Download inputs (now robust to Dropbox share URLs)
     download_file(str(request.video_url), video_path)
     download_file(str(request.audio_url), audio_path)
 
@@ -340,13 +359,9 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
     # Probe audio duration to set -t
     audio_duration = get_audio_duration_seconds(audio_path)
 
-    # Build FFmpeg command:
-    # - loop video indefinitely
-    # - cut at audio length
-    # - burn subtitles if they exist
+    # Build FFmpeg command
     vf_parts: List[str] = []
     if request.subtitles_url:
-        # subtitle filter reads local file; tempdir paths are safe
         vf_parts.append(f"subtitles={subs_path}")
 
     vf_arg = ",".join(vf_parts) if vf_parts else None
