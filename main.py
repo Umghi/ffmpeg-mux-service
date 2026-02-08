@@ -73,7 +73,7 @@ def download_file(url: str, dest_path: str) -> None:
     Stream-download a file to dest_path with size and HTML checks.
     Automatically normalizes Dropbox URLs to direct-download links.
     """
-    # NEW: normalize Dropbox share URLs
+    # normalize Dropbox share URLs
     url = _normalize_dropbox_url(url)
 
     try:
@@ -340,6 +340,10 @@ def srt_from_stt(payload: Any = Body(...)):
 def mux(request: MuxRequest, background_tasks: BackgroundTasks):
     """
     Mux video + audio (and optional burned-in subtitles) into a final MP4.
+    Enforces a 9:16 output frame (1080x1920) without distorting the source:
+    - scale to fit inside 1080x1920, preserving aspect ratio
+    - pad to exactly 1080x1920
+    - then burn subtitles if provided
     """
     job_id = uuid.uuid4().hex
     tmpdir = tempfile.mkdtemp(prefix=f"mux_{job_id}_")
@@ -359,13 +363,29 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
     # Probe audio duration to set -t
     audio_duration = get_audio_duration_seconds(audio_path)
 
-    # Build FFmpeg command
-    vf_parts: List[str] = []
+    # ---------------------------
+    # BUILD FILTER CHAIN (VF)
+    # ---------------------------
+    vf_filters: List[str] = []
+
+    # 1) Fit into 1080x1920 with correct aspect ratio (no stretching)
+    vf_filters.append(
+        "scale=1080:1920:force_original_aspect_ratio=decrease"
+    )
+    # 2) Pad to exactly 1080x1920 (centered)
+    vf_filters.append(
+        "pad=1080:1920:(1080-iw)/2:(1920-ih)/2"
+    )
+
+    # 3) Burn subtitles on top if provided
     if request.subtitles_url:
-        vf_parts.append(f"subtitles={subs_path}")
+        vf_filters.append(f"subtitles={subs_path}")
 
-    vf_arg = ",".join(vf_parts) if vf_parts else None
+    vf_arg = ",".join(vf_filters) if vf_filters else None
 
+    # ---------------------------
+    # BUILD FFMPEG CMD
+    # ---------------------------
     ffmpeg_cmd = [
         "ffmpeg",
         "-y",
