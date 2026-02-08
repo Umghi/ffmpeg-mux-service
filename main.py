@@ -425,6 +425,7 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
             output_path,
         ]
 
+        
         print("FFMPEG CMD:", " ".join(cmd))
 
         proc = subprocess.run(
