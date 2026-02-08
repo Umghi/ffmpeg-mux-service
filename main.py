@@ -344,6 +344,7 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
     - scale to fit inside 1080x1920, preserving aspect ratio
     - pad to exactly 1080x1920
     - then burn subtitles if provided
+    If ffmpeg fails with subtitles, we fall back to a second attempt without subtitles.
     """
     job_id = uuid.uuid4().hex
     tmpdir = tempfile.mkdtemp(prefix=f"mux_{job_id}_")
@@ -357,83 +358,104 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
     download_file(str(request.video_url), video_path)
     download_file(str(request.audio_url), audio_path)
 
-    if request.subtitles_url:
+    has_subs = bool(request.subtitles_url)
+    if has_subs:
         download_file(str(request.subtitles_url), subs_path)
+        # If Dropbox somehow gave us an empty SRT, ignore it.
+        try:
+            if os.path.getsize(subs_path) == 0:
+                has_subs = False
+        except OSError:
+            has_subs = False
 
     # Probe audio duration to set -t
     audio_duration = get_audio_duration_seconds(audio_path)
 
-    # ---------------------------
-    # BUILD FILTER CHAIN (VF)
-    # ---------------------------
-    vf_filters: List[str] = []
+    def build_filter_chain(include_subtitles: bool) -> str:
+        filters: List[str] = []
+        # 1) Fit into 1080x1920 with correct aspect ratio (no stretching)
+        filters.append(
+            "scale=1080:1920:force_original_aspect_ratio=decrease"
+        )
+        # 2) Pad to exactly 1080x1920 (centered)
+        filters.append(
+            "pad=1080:1920:(1080-iw)/2:(1920-ih)/2"
+        )
+        # 3) Optional subtitles on top
+        if include_subtitles:
+            filters.append(f"subtitles={subs_path}")
+        return ",".join(filters)
 
-    # 1) Fit into 1080x1920 with correct aspect ratio (no stretching)
-    vf_filters.append(
-        "scale=1080:1920:force_original_aspect_ratio=decrease"
-    )
-    # 2) Pad to exactly 1080x1920 (centered)
-    vf_filters.append(
-        "pad=1080:1920:(1080-iw)/2:(1920-ih)/2"
-    )
+    def run_ffmpeg(include_subtitles: bool) -> None:
+        vf_arg = build_filter_chain(include_subtitles)
 
-    # 3) Burn subtitles on top if provided
-    if request.subtitles_url:
-        vf_filters.append(f"subtitles={subs_path}")
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-stream_loop",
+            "-1",
+            "-i",
+            video_path,
+            "-i",
+            audio_path,
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-t",
+            f"{audio_duration:.3f}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-pix_fmt",
+            "yuv420p",
+            "-profile:v",
+            "high",
+            "-level",
+            "4.1",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+            "-vf",
+            vf_arg,
+            output_path,
+        ]
 
-    vf_arg = ",".join(vf_filters) if vf_filters else None
+        print("FFMPEG CMD:", " ".join(cmd))
 
-    # ---------------------------
-    # BUILD FFMPEG CMD
-    # ---------------------------
-    ffmpeg_cmd = [
-        "ffmpeg",
-        "-y",
-        "-stream_loop",
-        "-1",
-        "-i",
-        video_path,
-        "-i",
-        audio_path,
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:a:0",
-        "-t",
-        f"{audio_duration:.3f}",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-pix_fmt",
-        "yuv420p",
-        "-profile:v",
-        "high",
-        "-level",
-        "4.1",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        "-movflags",
-        "+faststart",
-    ]
-
-    if vf_arg:
-        ffmpeg_cmd += ["-vf", vf_arg]
-
-    ffmpeg_cmd.append(output_path)
-
-    try:
-        subprocess.run(
-            ffmpeg_cmd,
+        proc = subprocess.run(
+            cmd,
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=FFMPEG_TIMEOUT,
         )
+        stderr_tail = proc.stderr.decode(errors="ignore")[-1000:]
+        if stderr_tail:
+            print("FFMPEG STDERR (tail):", stderr_tail)
+
+    try:
+        # First attempt: with subtitles if we have them
+        if has_subs:
+            try:
+                run_ffmpeg(include_subtitles=True)
+            except subprocess.CalledProcessError as e:
+                # Log and fall back to no-subtitles attempt
+                error_tail = e.stderr.decode(errors="ignore")[-4000:]
+                print("FFMPEG FAILED WITH SUBTITLES, STDERR TAIL:\n", error_tail)
+                # Try again without subtitles
+                run_ffmpeg(include_subtitles=False)
+        else:
+            # No subtitles requested or SRT invalid: just video + audio
+            run_ffmpeg(include_subtitles=False)
+
     except subprocess.CalledProcessError as e:
         error_tail = e.stderr.decode(errors="ignore")[-4000:]
+        print("FFMPEG FAILED FINAL, STDERR TAIL:\n", error_tail)
         raise HTTPException(status_code=500, detail=f"ffmpeg failed: {error_tail}")
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=504, detail="ffmpeg timed out")
