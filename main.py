@@ -344,6 +344,8 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
     - Video: whatever resolution/AR the source has (your Grok output is already 9:16).
     - Audio: your ElevenLabs track.
     - Optional: burn SRT subtitles on top if provided.
+
+    Now with +1s extra video tail after audio ends.
     """
     job_id = uuid.uuid4().hex
     tmpdir = tempfile.mkdtemp(prefix=f"mux_{job_id}_")
@@ -366,8 +368,12 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
         except OSError:
             has_subs = False
 
-    # Probe audio duration to set -t (stop at audio length)
+    # Probe audio duration...
     audio_duration = get_audio_duration_seconds(audio_path)
+
+    # ...then extend output by +1 second of video tail.
+    tail_seconds = 1.0
+    output_duration = audio_duration + tail_seconds
 
     # Build filter chain: only subtitles if we have them
     vf_arg = None
@@ -388,7 +394,7 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
         "-map",
         "1:a:0",
         "-t",
-        f"{audio_duration:.3f}",
+        f"{output_duration:.3f}",   # <-- use extended duration here
         "-c:v",
         "libx264",
         "-preset",
@@ -413,6 +419,7 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
     ffmpeg_cmd.append(output_path)
 
     print("FFMPEG CMD:", " ".join(ffmpeg_cmd))
+    print(f"Audio duration: {audio_duration:.3f}s, output duration: {output_duration:.3f}s")
 
     try:
         proc = subprocess.run(
