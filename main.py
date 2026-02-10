@@ -378,7 +378,7 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
     if has_subs:
         # Tweak these to taste
         font_name = "Arial"           # must exist in the container
-        font_size = 25                # 30–40 tends to be nice for 1080p vertical
+        font_size = 20                # 30–40 tends to be nice for 1080p vertical
         margin_v = 60                 # pixels from bottom; higher = further up
         outline = 2                   # outline thickness
         shadow = 0                    # drop shadow amount
