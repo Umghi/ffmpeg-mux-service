@@ -20,6 +20,9 @@ DOWNLOAD_TIMEOUT = 120          # seconds per file download
 FFMPEG_TIMEOUT = 900            # seconds
 MAX_BYTES = 300 * 1024 * 1024   # 300MB safety limit
 
+# How long to keep the video running after audio stops (in seconds)
+VIDEO_TAIL_SECONDS = 1.0
+
 
 # ----------------------------
 # Request models
@@ -344,8 +347,6 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
     - Video: whatever resolution/AR the source has (your Grok output is already 9:16).
     - Audio: your ElevenLabs track.
     - Optional: burn SRT subtitles on top if provided.
-
-    Now with +1s extra video tail after audio ends.
     """
     job_id = uuid.uuid4().hex
     tmpdir = tempfile.mkdtemp(prefix=f"mux_{job_id}_")
@@ -368,17 +369,36 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
         except OSError:
             has_subs = False
 
-    # Probe audio duration...
+    # Probe audio duration to set -t (stop slightly AFTER audio length)
     audio_duration = get_audio_duration_seconds(audio_path)
+    total_duration = max(0.0, audio_duration + VIDEO_TAIL_SECONDS)
 
-    # ...then extend output by +1 second of video tail.
-    tail_seconds = 1.0
-    output_duration = audio_duration + tail_seconds
-
-    # Build filter chain: only subtitles if we have them
+    # Build subtitles filter with styling if we have subs
     vf_arg = None
     if has_subs:
-        vf_arg = f"subtitles={subs_path}"
+        # Tweak these to taste
+        font_name = "Arial"           # must exist in the container
+        font_size = 34                # 30–40 tends to be nice for 1080p vertical
+        margin_v = 60                 # pixels from bottom; higher = further up
+        outline = 3                   # outline thickness
+        shadow = 0                    # drop shadow amount
+        primary_colour = "&H00FFFFFF&"   # white
+        outline_colour = "&H00000000&"   # black
+
+        style = (
+            f"FontName={font_name},"
+            f"FontSize={font_size},"
+            f"PrimaryColour={primary_colour},"
+            f"OutlineColour={outline_colour},"
+            f"BorderStyle=1,"
+            f"Outline={outline},"
+            f"Shadow={shadow},"
+            f"MarginV={margin_v},"
+            f"Alignment=2"  # bottom-centre; keep this for “just off the bottom”
+        )
+
+        # Note: we rely on FFmpeg parsing this as one argument; tmp paths have no spaces by default
+        vf_arg = f"subtitles={subs_path}:force_style='{style}'"
 
     ffmpeg_cmd = [
         "ffmpeg",
@@ -394,7 +414,7 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
         "-map",
         "1:a:0",
         "-t",
-        f"{output_duration:.3f}",   # <-- use extended duration here
+        f"{total_duration:.3f}",   # <-- audio duration + 1 second
         "-c:v",
         "libx264",
         "-preset",
@@ -419,7 +439,6 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
     ffmpeg_cmd.append(output_path)
 
     print("FFMPEG CMD:", " ".join(ffmpeg_cmd))
-    print(f"Audio duration: {audio_duration:.3f}s, output duration: {output_duration:.3f}s")
 
     try:
         proc = subprocess.run(
