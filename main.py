@@ -1,10 +1,9 @@
 import os
-import re
 import uuid
-import json
 import shutil
 import tempfile
 import subprocess
+import random
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
@@ -23,13 +22,14 @@ FFMPEG_TIMEOUT = 1800           # seconds (library concat can take time)
 MAX_BYTES = 300 * 1024 * 1024   # 300MB safety limit
 VIDEO_TAIL_SECONDS = 1.0
 
-# Library normalisation target (match your Grok output)
+# Library normalisation target (match your vertical source)
 TARGET_W = 720
 TARGET_H = 1280
 TARGET_FPS = 24
 TARGET_PIXFMT = "yuv420p"
 TARGET_TIMESCALE = "60000"  # helps avoid "timescale not set" quirks
 
+DROPBOX_ACCESS_TOKEN = os.getenv("DROPBOX_ACCESS_TOKEN")
 
 # ----------------------------
 # Request models
@@ -45,13 +45,13 @@ class MuxRequest(BaseModel):
     subtitle_font_size: Optional[int] = None
 
     library_folder: Optional[str] = None   # Dropbox path like "/BIBLE/BibleLibrary/jerusalem_vertical/"
-    library_count: int = 10                # how many clips to fetch
-    transition: str = "fadeblack"          # currently only fadeblack supported
-    transition_duration: float = 0.35
+    library_count: int = 10                # max unique clips to sample from
+    transition: str = "fadeblack"          # fadeblack supported
+    transition_duration: float = 0.35      # seconds
 
 
 # ----------------------------
-# Helpers: download
+# Helpers: download (public URLs)
 # ----------------------------
 def _looks_like_html(first_bytes: bytes) -> bool:
     s = first_bytes.lstrip().lower()
@@ -109,10 +109,105 @@ def download_file(url: str, dest_path: str) -> None:
 
 
 # ----------------------------
+# Helpers: Dropbox (API)
+# ----------------------------
+def _dbx_headers_json() -> Dict[str, str]:
+    if not DROPBOX_ACCESS_TOKEN:
+        raise HTTPException(status_code=500, detail="DROPBOX_ACCESS_TOKEN not set on server")
+    return {
+        "Authorization": f"Bearer {DROPBOX_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+
+def dropbox_list_folder_mp4s(folder_path: str) -> List[str]:
+    """
+    Returns Dropbox paths (lowercase) for mp4 files in the folder.
+    Requires scopes:
+      - files.metadata.read
+    """
+    url = "https://api.dropboxapi.com/2/files/list_folder"
+    headers = _dbx_headers_json()
+
+    files: List[str] = []
+    payload: Dict[str, Any] = {"path": folder_path, "recursive": False, "include_non_downloadable_files": False}
+
+    r = requests.post(url, headers=headers, json=payload, timeout=30)
+    if r.status_code >= 400:
+        raise HTTPException(status_code=400, detail=f"Dropbox list_folder failed: {r.text}")
+
+    data = r.json()
+    while True:
+        for e in data.get("entries", []):
+            if e.get(".tag") == "file" and str(e.get("name", "")).lower().endswith(".mp4"):
+                # path_lower is safest to reuse
+                files.append(e.get("path_lower"))
+
+        if not data.get("has_more"):
+            break
+
+        cursor = data.get("cursor")
+        if not cursor:
+            break
+
+        r2 = requests.post(
+            "https://api.dropboxapi.com/2/files/list_folder/continue",
+            headers=headers,
+            json={"cursor": cursor},
+            timeout=30,
+        )
+        if r2.status_code >= 400:
+            raise HTTPException(status_code=400, detail=f"Dropbox list_folder/continue failed: {r2.text}")
+        data = r2.json()
+
+    # Filter out any Nones
+    return [p for p in files if p]
+
+
+def dropbox_download_path(dbx_path: str, dest_path: str) -> None:
+    """
+    Downloads a Dropbox file by path into dest_path.
+    Requires scopes:
+      - files.content.read
+    """
+    if not DROPBOX_ACCESS_TOKEN:
+        raise HTTPException(status_code=500, detail="DROPBOX_ACCESS_TOKEN not set on server")
+
+    url = "https://content.dropboxapi.com/2/files/download"
+    headers = {
+        "Authorization": f"Bearer {DROPBOX_ACCESS_TOKEN}",
+        "Dropbox-API-Arg": f'{{"path": "{dbx_path}"}}',
+    }
+
+    try:
+        with requests.post(url, headers=headers, stream=True, timeout=DOWNLOAD_TIMEOUT) as r:
+            if r.status_code >= 400:
+                raise HTTPException(status_code=400, detail=f"Dropbox download failed: {r.text}")
+
+            total = 0
+            wrote_any = False
+            with open(dest_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    if not wrote_any:
+                        wrote_any = True
+                    total += len(chunk)
+                    if total > MAX_BYTES:
+                        raise HTTPException(status_code=413, detail="Library clip too large")
+                    f.write(chunk)
+
+            if not wrote_any:
+                raise HTTPException(status_code=400, detail="Dropbox download returned empty file")
+
+    except requests.RequestException as e:
+        raise HTTPException(status_code=400, detail=f"Dropbox download request failed: {e}")
+
+
+# ----------------------------
 # Helpers: ffmpeg/ffprobe
 # ----------------------------
 def _run(cmd: List[str], timeout: int = FFMPEG_TIMEOUT) -> str:
-    """Run a subprocess and return stderr tail for logging/debug. Raises on failure."""
     try:
         proc = subprocess.run(
             cmd,
@@ -125,11 +220,11 @@ def _run(cmd: List[str], timeout: int = FFMPEG_TIMEOUT) -> str:
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=504, detail="ffmpeg timed out")
     except subprocess.CalledProcessError as e:
-        tail = e.stderr.decode(errors="ignore")[-6000:]
+        tail = e.stderr.decode(errors="ignore")[-12000:]
         raise HTTPException(status_code=500, detail=f"ffmpeg failed: {tail}")
 
 
-def get_audio_duration_seconds(path: str) -> float:
+def get_duration_seconds(path: str) -> float:
     cmd = [
         "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
@@ -148,22 +243,40 @@ def get_audio_duration_seconds(path: str) -> float:
         raise HTTPException(status_code=500, detail=f"ffprobe failed: {e}")
 
 
-def normalize_clip(src_mp4: str, dst_mp4: str) -> None:
+def normalize_clip(
+    src_mp4: str,
+    dst_mp4: str,
+    fade_in: float = 0.0,
+    fade_out: float = 0.0
+) -> None:
     """
     Make every library clip identical for concat:
     - keep ONLY video stream
-    - remove attachments/subs/data
+    - remove attachments/subs/data (fixes 'attached pic' mjpeg streams)
     - force scale, fps (CFR), pix_fmt
     - force track timescale
-    - strip metadata
+    - optional fade in/out to black
     """
+    # We need duration for fade-out timing
+    dur = get_duration_seconds(src_mp4)
+    vf_parts = [f"scale={TARGET_W}:{TARGET_H}", f"fps={TARGET_FPS}", f"format={TARGET_PIXFMT}"]
+
+    if fade_in and fade_in > 0:
+        vf_parts.append(f"fade=t=in:st=0:d={fade_in}")
+
+    if fade_out and fade_out > 0 and dur > (fade_out + 0.05):
+        st = max(0.0, dur - fade_out)
+        vf_parts.append(f"fade=t=out:st={st}:d={fade_out}")
+
+    vf = ",".join(vf_parts)
+
     cmd = [
         "ffmpeg", "-y",
         "-i", src_mp4,
         "-map", "0:v:0",
         "-an", "-sn", "-dn",
         "-map_metadata", "-1",
-        "-vf", f"scale={TARGET_W}:{TARGET_H},fps={TARGET_FPS},format={TARGET_PIXFMT}",
+        "-vf", vf,
         "-fps_mode", "cfr",
         "-video_track_timescale", TARGET_TIMESCALE,
         "-c:v", "libx264",
@@ -177,13 +290,11 @@ def normalize_clip(src_mp4: str, dst_mp4: str) -> None:
 
 def concat_library(clean_paths: List[str], joined_out: str) -> None:
     """
-    Concat using concat demuxer (very reliable) and re-encode once.
+    Concat using concat demuxer (reliable) and re-encode once.
     """
-    # Build list file
     list_path = os.path.join(os.path.dirname(joined_out), "concat_list.txt")
     with open(list_path, "w", encoding="utf-8") as f:
         for p in clean_paths:
-            # concat demuxer needs: file '/path'
             f.write(f"file '{p}'\n")
 
     cmd = [
@@ -237,7 +348,6 @@ def _extract_words_from_payload(payload: Any) -> List[Dict[str, Any]]:
 
 
 def words_to_captions(words: List[Dict[str, Any]], profile: str) -> List[Dict[str, Any]]:
-    # Defaults
     if profile == "bible":
         max_chars = 54
         max_words = 11
@@ -312,15 +422,18 @@ def srt_from_stt(payload: Any = Body(...), profile: str = "menopause"):
     return PlainTextResponse(content=captions_to_srt(captions), media_type="text/plain")
 
 
+@app.get("/health", response_class=PlainTextResponse)
+def health():
+    return PlainTextResponse("ok")
+
+
 # ----------------------------
 # Fonts helper endpoint
 # ----------------------------
 @app.get("/fonts", response_class=PlainTextResponse)
 def list_fonts():
-    # fc-list is available on most linux images; if not, return a helpful message
     try:
         out = subprocess.check_output(["fc-list", ":family"], timeout=10).decode(errors="ignore")
-        # de-dup and keep it readable
         families = sorted(set([x.split(":")[0].strip() for x in out.splitlines() if x.strip()]))
         return PlainTextResponse("\n".join(families))
     except Exception:
@@ -339,92 +452,140 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
     subs_path = os.path.join(tmpdir, "subs.srt")
     output_path = os.path.join(tmpdir, "output.mp4")
 
-    # download audio
-    download_file(str(request.audio_url), audio_path)
-
-    # subtitles (optional)
-    has_subs = False
-    if request.subtitles_url:
-        download_file(str(request.subtitles_url), subs_path)
-        has_subs = os.path.getsize(subs_path) > 0
-
-    # duration
-    audio_duration = get_audio_duration_seconds(audio_path)
-    total_duration = max(0.0, audio_duration + VIDEO_TAIL_SECONDS)
-
-    # choose video source:
-    # 1) library mode -> build a joined video
-    # 2) direct video_url -> use it
-    video_path = None
-    if request.library_folder:
-        # NOTE: Your service already has Dropbox list_folder logic somewhere.
-        # This stub assumes you have a function that returns direct-download URLs for N clips.
-        # If not, keep your existing Dropbox API logic and just plug in the returned URLs below.
-        raise HTTPException(
-            status_code=400,
-            detail="library_folder provided but Dropbox listing is not wired in this script stub."
-        )
-
-    if request.video_url:
-        video_path = os.path.join(tmpdir, "video.mp4")
-        download_file(str(request.video_url), video_path)
-
-    if not video_path:
-        raise HTTPException(
-            status_code=400,
-            detail="video_url is required unless library selection is implemented in the mux service."
-        )
-
-    # Subtitle styling per profile
-    vf_arg = None
-    if has_subs:
-        if request.subtitle_profile == "bible":
-            font_name = request.subtitle_font or "DejaVu Sans"
-            font_size = request.subtitle_font_size or 28
-            margin_v = 90
-            outline = 3
-        else:
-            font_name = request.subtitle_font or "Arial"
-            font_size = request.subtitle_font_size or 16
-            margin_v = 40
-            outline = 2
-
-        style = (
-            f"FontName={font_name},"
-            f"FontSize={font_size},"
-            f"PrimaryColour=&H00FFFFFF&,"
-            f"OutlineColour=&H00000000&,"
-            f"BorderStyle=1,"
-            f"Outline={outline},"
-            f"Shadow=0,"
-            f"MarginV={margin_v},"
-            f"Alignment=2"
-        )
-        vf_arg = f"subtitles={subs_path}:force_style='{style}'"
-
-    ffmpeg_cmd = [
-        "ffmpeg", "-y",
-        "-stream_loop", "-1",
-        "-i", video_path,
-        "-i", audio_path,
-        "-map", "0:v:0",
-        "-map", "1:a:0",
-        "-t", f"{total_duration:.3f}",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-b:a", "192k",
-        "-movflags", "+faststart",
-    ]
-    if vf_arg:
-        ffmpeg_cmd += ["-vf", vf_arg]
-
-    ffmpeg_cmd.append(output_path)
-
     try:
-        _run(ffmpeg_cmd, timeout=FFMPEG_TIMEOUT)
-    finally:
-        background_tasks.add_task(shutil.rmtree, tmpdir, True)
+        # 1) download audio
+        download_file(str(request.audio_url), audio_path)
 
-    return FileResponse(output_path, media_type="video/mp4", filename=f"final_{job_id}.mp4")
+        # 2) subtitles (optional)
+        has_subs = False
+        if request.subtitles_url:
+            download_file(str(request.subtitles_url), subs_path)
+            has_subs = os.path.getsize(subs_path) > 0
+
+        # 3) duration
+        audio_duration = get_duration_seconds(audio_path)
+        total_duration = max(0.0, audio_duration + VIDEO_TAIL_SECONDS)
+
+        # 4) Choose video source:
+        #    A) library mode -> build joined video bed
+        #    B) direct video_url -> use it
+        video_path = None
+
+        if request.library_folder:
+            if request.transition != "fadeblack":
+                raise HTTPException(status_code=400, detail="Only transition='fadeblack' is supported currently")
+
+            # list available clips
+            mp4_paths = dropbox_list_folder_mp4s(request.library_folder)
+            if not mp4_paths:
+                raise HTTPException(status_code=400, detail="No .mp4 files found in library_folder")
+
+            # sample pool (up to library_count unique)
+            pool_size = min(max(1, request.library_count), len(mp4_paths))
+            pool = random.sample(mp4_paths, pool_size)
+
+            # download + build enough clips to cover total_duration
+            clean_paths: List[str] = []
+            assembled = 0.0
+
+            # safety limit so we don't go wild
+            max_clips = 40
+
+            i = 0
+            while assembled < total_duration and i < max_clips:
+                dbx_path = random.choice(pool)
+
+                raw_path = os.path.join(tmpdir, f"lib_{i}.mp4")
+                clean_path = os.path.join(tmpdir, f"lib_{i}_clean.mp4")
+
+                dropbox_download_path(dbx_path, raw_path)
+
+                # fade rules:
+                # - first clip: fade OUT only
+                # - middle clips: fade IN + fade OUT
+                # - last clip: we'll still fade out; final trim makes it OK
+                fade_in = request.transition_duration if i > 0 else 0.0
+                fade_out = request.transition_duration
+
+                normalize_clip(raw_path, clean_path, fade_in=fade_in, fade_out=fade_out)
+
+                d = get_duration_seconds(clean_path)
+                assembled += d
+                clean_paths.append(clean_path)
+                i += 1
+
+            if not clean_paths:
+                raise HTTPException(status_code=400, detail="Failed to prepare any library clips")
+
+            joined = os.path.join(tmpdir, "library_joined.mp4")
+            concat_library(clean_paths, joined)
+            video_path = joined
+
+        if request.video_url and not video_path:
+            video_path = os.path.join(tmpdir, "video.mp4")
+            download_file(str(request.video_url), video_path)
+
+        if not video_path:
+            raise HTTPException(
+                status_code=400,
+                detail="video_url is required unless library_folder is provided."
+            )
+
+        # 5) Subtitle styling per profile
+        vf_arg = None
+        if has_subs:
+            if request.subtitle_profile == "bible":
+                font_name = request.subtitle_font or "DejaVu Sans"
+                font_size = request.subtitle_font_size or 28
+                margin_v = 90
+                outline = 3
+            else:
+                font_name = request.subtitle_font or "Arial"
+                font_size = request.subtitle_font_size or 16
+                margin_v = 40
+                outline = 2
+
+            style = (
+                f"FontName={font_name},"
+                f"FontSize={font_size},"
+                f"PrimaryColour=&H00FFFFFF&,"
+                f"OutlineColour=&H00000000&,"
+                f"BorderStyle=1,"
+                f"Outline={outline},"
+                f"Shadow=0,"
+                f"MarginV={margin_v},"
+                f"Alignment=2"
+            )
+            vf_arg = f"subtitles={subs_path}:force_style='{style}'"
+
+        # 6) Mux: loop video if it somehow comes short, then trim to audio duration
+        ffmpeg_cmd = [
+            "ffmpeg", "-y",
+            "-stream_loop", "-1",
+            "-i", video_path,
+            "-i", audio_path,
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-t", f"{total_duration:.3f}",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-movflags", "+faststart",
+        ]
+        if vf_arg:
+            ffmpeg_cmd += ["-vf", vf_arg]
+
+        ffmpeg_cmd.append(output_path)
+
+        _run(ffmpeg_cmd, timeout=FFMPEG_TIMEOUT)
+
+        # IMPORTANT: don't delete tmpdir until after response completes
+        background_tasks.add_task(shutil.rmtree, tmpdir, True)
+        return FileResponse(output_path, media_type="video/mp4", filename=f"final_{job_id}.mp4")
+
+    except Exception:
+        # ensure cleanup on failure too
+        background_tasks.add_task(shutil.rmtree, tmpdir, True)
+        raise
