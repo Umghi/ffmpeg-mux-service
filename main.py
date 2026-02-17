@@ -47,7 +47,7 @@ class MuxRequest(BaseModel):
     library_folder: Optional[str] = None   # Dropbox path like "/BIBLE/BibleLibrary/jerusalem_vertical/"
     library_count: int = 10                # max unique clips to sample from
     transition: str = "fadeblack"          # fadeblack supported
-    transition_duration: float = 0.35      # seconds
+    transition_duration: float = 0.5      # seconds
 
 
 # ----------------------------
@@ -349,8 +349,8 @@ def _extract_words_from_payload(payload: Any) -> List[Dict[str, Any]]:
 
 def words_to_captions(words: List[Dict[str, Any]], profile: str) -> List[Dict[str, Any]]:
     if profile == "bible":
-        max_chars = 54
-        max_words = 11
+        max_chars = 75
+        max_words = 16
         max_duration = 3.2
         min_duration = 0.6
     else:
@@ -536,7 +536,7 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
         if has_subs:
             if request.subtitle_profile == "bible":
                 font_name = request.subtitle_font or "DejaVu Sans"
-                font_size = request.subtitle_font_size or 28
+                font_size = request.subtitle_font_size or 16
                 margin_v = 90
                 outline = 3
             else:
