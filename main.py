@@ -21,21 +21,22 @@ FFMPEG_TIMEOUT = 2400
 MAX_BYTES = int(os.getenv("MAX_BYTES", str(300 * 1024 * 1024)))
 VIDEO_TAIL_SECONDS = 1.0
 
-# Video normalization target
 TARGET_W = 720
 TARGET_H = 1280
 TARGET_FPS = 24
 TARGET_PIXFMT = "yuv420p"
 TARGET_TIMESCALE = "60000"
 
-# Audio targets
 TARGET_AR = 44100
 TARGET_AC = 2
 TARGET_AB = "128k"
 NARRATION_AB = "192k"
 
 DROPBOX_TOKEN = os.getenv("DROPBOX_TOKEN", "").strip()
+
 DEBUG_PROBES = os.getenv("DEBUG_PROBES", "1").strip() not in ("0", "false", "False")
+# Temporary “make it obviously audible” boost. Set to 1.0 later.
+NARRATION_GAIN = float(os.getenv("NARRATION_GAIN", "2.5"))  # 2.5x gain to prove it’s there
 
 
 # ----------------------------
@@ -251,9 +252,6 @@ def video_has_audio_stream(path: str) -> bool:
 
 
 def normalize_narration(src_audio: str, dst_m4a: str) -> None:
-    """
-    Normalize ElevenLabs audio to AAC-LC with sane timestamps + loudness.
-    """
     cmd = [
         "ffmpeg", "-y",
         "-i", src_audio,
@@ -272,7 +270,6 @@ def normalize_narration(src_audio: str, dst_m4a: str) -> None:
         "-c:a", "aac",
         "-profile:a", "aac_low",
         "-b:a", NARRATION_AB,
-        # Ensure the audio file itself has correct handler metadata
         "-map_metadata", "-1",
         "-metadata:s:a:0", "handler_name=SoundHandler",
         "-metadata:s:a:0", "title=Narration",
@@ -310,7 +307,6 @@ def normalize_clip(src_mp4: str, dst_mp4: str, keep_audio: bool) -> None:
                 "-profile:a", "aac_low",
                 "-b:a", TARGET_AB,
                 "-t", f"{dur:.3f}",
-                # sane handler names
                 "-metadata:s:v:0", "handler_name=VideoHandler",
                 "-metadata:s:a:0", "handler_name=SoundHandler",
                 "-movflags", "+faststart",
@@ -518,7 +514,7 @@ def list_fonts():
 
 
 # ----------------------------
-# /mux endpoint
+# /mux endpoint (TWO-STEP OUTPUT)
 # ----------------------------
 @app.post("/mux")
 def mux(request: MuxRequest, background_tasks: BackgroundTasks):
@@ -526,29 +522,21 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
     tmpdir = tempfile.mkdtemp(prefix=f"mux_{job_id}_")
 
     raw_audio_path = os.path.join(tmpdir, "narration_raw.mp3")
-    audio_path = os.path.join(tmpdir, "narration_norm.m4a")
+    narration_path = os.path.join(tmpdir, "narration_norm.m4a")
+
     subs_path = os.path.join(tmpdir, "subs.srt")
-    output_path = os.path.join(tmpdir, "output.mp4")
+
+    video_render_path = os.path.join(tmpdir, "video_render.mp4")  # step 1 output (video-only)
+    output_path = os.path.join(tmpdir, "output.mp4")              # step 2 output (final)
 
     try:
-        # 1) Download narration
+        # 1) Download + normalize narration
         download_file(str(request.audio_url), raw_audio_path)
-        if DEBUG_PROBES:
-            try:
-                print("RAW AUDIO PROBE:", ffprobe_streams(raw_audio_path))
-            except Exception as e:
-                print("RAW AUDIO PROBE FAILED:", repr(e))
+        normalize_narration(raw_audio_path, narration_path)
+        assert_audio_not_silent(narration_path)
 
-        # 1b) Normalize narration
-        normalize_narration(raw_audio_path, audio_path)
         if DEBUG_PROBES:
-            try:
-                print("NORM AUDIO PROBE:", ffprobe_streams(audio_path))
-            except Exception as e:
-                print("NORM AUDIO PROBE FAILED:", repr(e))
-
-        # 1c) Ensure narration isn't silent
-        assert_audio_not_silent(audio_path)
+            print("NARRATION PROBE:", ffprobe_streams(narration_path))
 
         # 2) Optional subtitles
         has_subs = False
@@ -556,11 +544,11 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
             download_file(str(request.subtitles_url), subs_path)
             has_subs = os.path.getsize(subs_path) > 0
 
-        # 3) Duration
-        narration_dur = get_duration_seconds(audio_path)
+        # 3) Duration target
+        narration_dur = get_duration_seconds(narration_path)
         total_duration = max(0.0, narration_dur + VIDEO_TAIL_SECONDS)
 
-        # 4) Resolve video source
+        # 4) Resolve video source (library or direct)
         video_path: Optional[str] = None
 
         if request.library_folder:
@@ -619,91 +607,121 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
             )
             vf_arg = f"subtitles={subs_path}:force_style='{style}'"
 
-        # 6) Final mux
-        has_video_audio = bool(request.include_ambience) and video_has_audio_stream(video_path)
-
-        ffmpeg_cmd = [
+        # ============================
+        # STEP 1: render VIDEO ONLY
+        # ============================
+        step1_cmd = [
             "ffmpeg", "-y",
             "-stream_loop", "-1",
-            "-i", video_path,   # input 0
-            "-i", audio_path,   # input 1 (normalized narration)
+            "-i", video_path,
             "-t", f"{total_duration:.3f}",
+            "-map_metadata", "-1",
+            "-map", "0:v:0",
+            "-an",
             "-fflags", "+genpts",
             "-avoid_negative_ts", "make_zero",
-
-            # CRITICAL: prevent metadata bleed and ensure correct handler names
-            "-map_metadata", "-1",
-        ]
-
-        # Video args
-        video_out_args = [
+            "-vf",
+            (
+                (vf_arg + ",") if vf_arg else ""
+            )
+            + f"scale={TARGET_W}:{TARGET_H},fps={TARGET_FPS},format={TARGET_PIXFMT}",
+            "-fps_mode", "cfr",
+            "-video_track_timescale", TARGET_TIMESCALE,
             "-c:v", "libx264",
             "-preset", "veryfast",
             "-pix_fmt", TARGET_PIXFMT,
             "-movflags", "+faststart",
-
-            # enforce correct handler
             "-metadata:s:v:0", "handler_name=VideoHandler",
+            video_render_path,
         ]
-        if vf_arg:
-            video_out_args = ["-vf", vf_arg] + video_out_args
-
-        if has_video_audio:
-            amb_vol = max(0.0, min(float(request.ambience_volume), 1.0))
-
-            # Reset timestamps on both audio sources to avoid weird offsets
-            # Slightly boost narration (1.15) so it can’t get “lost” in the mix
-            audio_filter = (
-                f"[0:a]asetpts=PTS-STARTPTS,"
-                f"aformat=sample_rates={TARGET_AR}:channel_layouts=stereo,"
-                f"volume={amb_vol}[amb];"
-                f"[1:a]asetpts=PTS-STARTPTS,"
-                f"aformat=sample_rates={TARGET_AR}:channel_layouts=stereo,"
-                f"volume=1.15[nar];"
-                f"[amb][nar]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=250[ducked];"
-                f"[ducked][nar]amix=inputs=2:duration=first:dropout_transition=2,"
-                f"alimiter=limit=0.95[aout]"
-            )
-
-            ffmpeg_cmd += [
-                "-filter_complex", audio_filter,
-                "-map", "0:v:0",
-                "-map", "[aout]",
-                "-c:a", "aac",
-                "-profile:a", "aac_low",
-                "-b:a", NARRATION_AB,
-                "-ar", str(TARGET_AR),
-                "-ac", str(TARGET_AC),
-
-                # enforce correct audio handler + disposition
-                "-metadata:s:a:0", "handler_name=SoundHandler",
-                "-metadata:s:a:0", "title=Narration",
-                "-disposition:a:0", "default",
-            ] + video_out_args + [output_path]
-        else:
-            ffmpeg_cmd += [
-                "-map", "0:v:0",
-                "-map", "1:a:0",
-                "-c:a", "aac",
-                "-profile:a", "aac_low",
-                "-b:a", NARRATION_AB,
-                "-ar", str(TARGET_AR),
-                "-ac", str(TARGET_AC),
-                "-af", f"asetpts=PTS-STARTPTS,aresample={TARGET_AR}:async=1",
-
-                # enforce correct audio handler + disposition
-                "-metadata:s:a:0", "handler_name=SoundHandler",
-                "-metadata:s:a:0", "title=Narration",
-                "-disposition:a:0", "default",
-            ] + video_out_args + [output_path]
-
-        _run(ffmpeg_cmd, timeout=FFMPEG_TIMEOUT)
+        _run(step1_cmd, timeout=FFMPEG_TIMEOUT)
 
         if DEBUG_PROBES:
-            try:
-                print("OUTPUT PROBE:", ffprobe_streams(output_path))
-            except Exception as e:
-                print("OUTPUT PROBE FAILED:", repr(e))
+            print("VIDEO_RENDER PROBE:", ffprobe_streams(video_render_path))
+
+        # ============================
+        # STEP 2: add/mix AUDIO
+        # ============================
+        # If you want ambience, bring it from the ORIGINAL video (not the rendered one),
+        # because the rendered one is video-only.
+        has_amb = bool(request.include_ambience) and video_has_audio_stream(video_path)
+
+        if has_amb:
+            amb_vol = max(0.0, min(float(request.ambience_volume), 1.0))
+
+            step2_cmd = [
+                "ffmpeg", "-y",
+                "-i", video_render_path,   # 0: video-only
+                "-i", video_path,          # 1: original video for ambience audio
+                "-i", narration_path,      # 2: narration
+                "-t", f"{total_duration:.3f}",
+                "-map_metadata", "-1",
+                "-fflags", "+genpts",
+                "-avoid_negative_ts", "make_zero",
+                "-filter_complex",
+                (
+                    f"[1:a]asetpts=PTS-STARTPTS,"
+                    f"aformat=sample_rates={TARGET_AR}:channel_layouts=stereo,"
+                    f"volume={amb_vol}[amb];"
+                    f"[2:a]asetpts=PTS-STARTPTS,"
+                    f"aformat=sample_rates={TARGET_AR}:channel_layouts=stereo,"
+                    f"volume={NARRATION_GAIN}[nar];"
+                    f"[amb][nar]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=250[ducked];"
+                    f"[ducked][nar]amix=inputs=2:duration=first:dropout_transition=2,"
+                    f"alimiter=limit=0.95[aout]"
+                ),
+                "-map", "0:v:0",
+                "-map", "[aout]",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-profile:a", "aac_low",
+                "-b:a", NARRATION_AB,
+                "-ar", str(TARGET_AR),
+                "-ac", str(TARGET_AC),
+                "-metadata:s:v:0", "handler_name=VideoHandler",
+                "-metadata:s:a:0", "handler_name=SoundHandler",
+                "-metadata:s:a:0", "title=Narration",
+                "-disposition:a:0", "default",
+                "-movflags", "+faststart",
+                output_path,
+            ]
+        else:
+            # Narration only (no ambience)
+            step2_cmd = [
+                "ffmpeg", "-y",
+                "-i", video_render_path,
+                "-i", narration_path,
+                "-t", f"{total_duration:.3f}",
+                "-map_metadata", "-1",
+                "-fflags", "+genpts",
+                "-avoid_negative_ts", "make_zero",
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-profile:a", "aac_low",
+                "-b:a", NARRATION_AB,
+                "-ar", str(TARGET_AR),
+                "-ac", str(TARGET_AC),
+                # PROOF BOOST:
+                "-af", f"asetpts=PTS-STARTPTS,volume={NARRATION_GAIN}",
+                "-metadata:s:v:0", "handler_name=VideoHandler",
+                "-metadata:s:a:0", "handler_name=SoundHandler",
+                "-metadata:s:a:0", "title=Narration",
+                "-disposition:a:0", "default",
+                "-movflags", "+faststart",
+                output_path,
+            ]
+
+        _run(step2_cmd, timeout=FFMPEG_TIMEOUT)
+
+        if DEBUG_PROBES:
+            print("OUTPUT PROBE:", ffprobe_streams(output_path))
+            # Extra: extract final audio track to prove it contains sound
+            extracted = os.path.join(tmpdir, "extracted_audio.m4a")
+            _run(["ffmpeg", "-y", "-i", output_path, "-map", "0:a:0", "-c", "copy", extracted], timeout=300)
+            print("EXTRACTED AUDIO PROBE:", ffprobe_streams(extracted))
+            assert_audio_not_silent(extracted)
 
         return FileResponse(output_path, media_type="video/mp4", filename=f"final_{job_id}.mp4")
 
