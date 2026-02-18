@@ -29,14 +29,11 @@ TARGET_TIMESCALE = "60000"
 
 TARGET_AR = 44100
 TARGET_AC = 2
-TARGET_AB = "128k"
 NARRATION_AB = "192k"
 
 DROPBOX_TOKEN = os.getenv("DROPBOX_TOKEN", "").strip()
 
-DEBUG_PROBES = os.getenv("DEBUG_PROBES", "1").strip() not in ("0", "false", "False")
-# Temporary “make it obviously audible” boost. Set to 1.0 later.
-NARRATION_GAIN = float(os.getenv("NARRATION_GAIN", "2.5"))  # 2.5x gain to prove it’s there
+DEBUG_PROBES = os.getenv("DEBUG_PROBES", "0").strip() not in ("0", "false", "False")
 
 
 # ----------------------------
@@ -47,15 +44,12 @@ class MuxRequest(BaseModel):
     audio_url: HttpUrl
     subtitles_url: Optional[HttpUrl] = None
 
-    subtitle_profile: str = "menopause"
+    subtitle_profile: str = "menopause"  # "menopause" | "bible"
     subtitle_font: Optional[str] = None
     subtitle_font_size: Optional[int] = None
 
     library_folder: Optional[str] = None
     library_count: int = 10
-
-    include_ambience: bool = True
-    ambience_volume: float = 0.12
 
 
 # ----------------------------
@@ -198,25 +192,6 @@ def ffprobe_streams(path: str) -> str:
     ).decode(errors="ignore")
 
 
-def assert_audio_not_silent(path: str) -> None:
-    cmd = ["ffmpeg", "-y", "-i", path, "-vn", "-af", "volumedetect", "-f", "null", "-"]
-    out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
-    stderr = out.stderr.decode(errors="ignore")
-
-    max_val: Optional[float] = None
-    for line in stderr.splitlines():
-        if "max_volume:" in line:
-            try:
-                part = line.split("max_volume:")[1].strip()
-                max_val = float(part.split(" ")[0])
-                break
-            except Exception:
-                pass
-
-    if max_val is not None and max_val < -60.0:
-        raise HTTPException(status_code=400, detail=f"Narration appears silent (max_volume {max_val} dB).")
-
-
 def get_duration_seconds(path: str) -> float:
     cmd = [
         "ffprobe", "-v", "error",
@@ -236,22 +211,14 @@ def get_duration_seconds(path: str) -> float:
         raise HTTPException(status_code=500, detail=f"ffprobe failed: {e}")
 
 
-def video_has_audio_stream(path: str) -> bool:
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-select_streams", "a:0",
-        "-show_entries", "stream=index",
-        "-of", "csv=p=0",
-        path
-    ]
-    try:
-        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=15).decode().strip()
-        return out != ""
-    except Exception:
-        return False
-
-
 def normalize_narration(src_audio: str, dst_m4a: str) -> None:
+    """
+    Normalize narration to a clean, compatible AAC-LC track:
+    - timestamps start at 0
+    - stereo 44.1k
+    - loudness normalized (prevents "it's there but quiet")
+    - sets correct MP4 audio handler
+    """
     cmd = [
         "ffmpeg", "-y",
         "-i", src_audio,
@@ -279,90 +246,32 @@ def normalize_narration(src_audio: str, dst_m4a: str) -> None:
     _run(cmd, timeout=FFMPEG_TIMEOUT)
 
 
-def normalize_clip(src_mp4: str, dst_mp4: str, keep_audio: bool) -> None:
-    dur = get_duration_seconds(src_mp4)
-
-    if keep_audio:
-        has_a = video_has_audio_stream(src_mp4)
-        if has_a:
-            cmd = [
-                "ffmpeg", "-y",
-                "-i", src_mp4,
-                "-map", "0:v:0",
-                "-map", "0:a:0",
-                "-sn", "-dn",
-                "-map_metadata", "-1",
-                "-fflags", "+genpts",
-                "-avoid_negative_ts", "make_zero",
-                "-vf", f"scale={TARGET_W}:{TARGET_H},fps={TARGET_FPS},format={TARGET_PIXFMT}",
-                "-fps_mode", "cfr",
-                "-video_track_timescale", TARGET_TIMESCALE,
-                "-c:v", "libx264",
-                "-preset", "veryfast",
-                "-pix_fmt", TARGET_PIXFMT,
-                "-af", f"aresample={TARGET_AR}:async=1, aformat=channel_layouts=stereo",
-                "-ac", str(TARGET_AC),
-                "-ar", str(TARGET_AR),
-                "-c:a", "aac",
-                "-profile:a", "aac_low",
-                "-b:a", TARGET_AB,
-                "-t", f"{dur:.3f}",
-                "-metadata:s:v:0", "handler_name=VideoHandler",
-                "-metadata:s:a:0", "handler_name=SoundHandler",
-                "-movflags", "+faststart",
-                dst_mp4,
-            ]
-        else:
-            cmd = [
-                "ffmpeg", "-y",
-                "-i", src_mp4,
-                "-f", "lavfi",
-                "-i", f"anullsrc=channel_layout=stereo:sample_rate={TARGET_AR}",
-                "-map", "0:v:0",
-                "-map", "1:a:0",
-                "-sn", "-dn",
-                "-map_metadata", "-1",
-                "-fflags", "+genpts",
-                "-avoid_negative_ts", "make_zero",
-                "-vf", f"scale={TARGET_W}:{TARGET_H},fps={TARGET_FPS},format={TARGET_PIXFMT}",
-                "-fps_mode", "cfr",
-                "-video_track_timescale", TARGET_TIMESCALE,
-                "-c:v", "libx264",
-                "-preset", "veryfast",
-                "-pix_fmt", TARGET_PIXFMT,
-                "-c:a", "aac",
-                "-profile:a", "aac_low",
-                "-b:a", TARGET_AB,
-                "-t", f"{dur:.3f}",
-                "-metadata:s:v:0", "handler_name=VideoHandler",
-                "-metadata:s:a:0", "handler_name=SoundHandler",
-                "-movflags", "+faststart",
-                dst_mp4,
-            ]
-    else:
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", src_mp4,
-            "-map", "0:v:0",
-            "-an", "-sn", "-dn",
-            "-map_metadata", "-1",
-            "-fflags", "+genpts",
-            "-avoid_negative_ts", "make_zero",
-            "-vf", f"scale={TARGET_W}:{TARGET_H},fps={TARGET_FPS},format={TARGET_PIXFMT}",
-            "-fps_mode", "cfr",
-            "-video_track_timescale", TARGET_TIMESCALE,
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-pix_fmt", TARGET_PIXFMT,
-            "-metadata:s:v:0", "handler_name=VideoHandler",
-            "-movflags", "+faststart",
-            dst_mp4,
-        ]
-
+def normalize_clip_video_only(src_mp4: str, dst_mp4: str) -> None:
+    """
+    Normalize ONLY video (no audio) to be concat-safe.
+    """
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", src_mp4,
+        "-map", "0:v:0",
+        "-an", "-sn", "-dn",
+        "-map_metadata", "-1",
+        "-fflags", "+genpts",
+        "-avoid_negative_ts", "make_zero",
+        "-vf", f"scale={TARGET_W}:{TARGET_H},fps={TARGET_FPS},format={TARGET_PIXFMT}",
+        "-fps_mode", "cfr",
+        "-video_track_timescale", TARGET_TIMESCALE,
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-pix_fmt", TARGET_PIXFMT,
+        "-metadata:s:v:0", "handler_name=VideoHandler",
+        "-movflags", "+faststart",
+        dst_mp4,
+    ]
     _run(cmd, timeout=FFMPEG_TIMEOUT)
 
 
-def concat_library(clean_paths: List[str], joined_out: str, keep_audio: bool) -> None:
+def concat_library_video_only(clean_paths: List[str], joined_out: str) -> None:
     list_path = os.path.join(os.path.dirname(joined_out), "concat_list.txt")
     with open(list_path, "w", encoding="utf-8") as f:
         for p in clean_paths:
@@ -379,28 +288,16 @@ def concat_library(clean_paths: List[str], joined_out: str, keep_audio: bool) ->
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-pix_fmt", TARGET_PIXFMT,
-        "-movflags", "+faststart",
+        "-an",
         "-metadata:s:v:0", "handler_name=VideoHandler",
+        "-movflags", "+faststart",
+        joined_out,
     ]
-
-    if keep_audio:
-        cmd += [
-            "-c:a", "aac",
-            "-profile:a", "aac_low",
-            "-b:a", TARGET_AB,
-            "-ar", str(TARGET_AR),
-            "-ac", str(TARGET_AC),
-            "-metadata:s:a:0", "handler_name=SoundHandler",
-        ]
-    else:
-        cmd += ["-an"]
-
-    cmd.append(joined_out)
     _run(cmd, timeout=FFMPEG_TIMEOUT)
 
 
 # ----------------------------
-# Subtitles (SRT) generation
+# Subtitles (SRT) generation (unchanged)
 # ----------------------------
 def srt_timestamp(seconds: float) -> str:
     if seconds < 0:
@@ -514,7 +411,7 @@ def list_fonts():
 
 
 # ----------------------------
-# /mux endpoint (TWO-STEP OUTPUT)
+# /mux endpoint (video audio removed, narration added)
 # ----------------------------
 @app.post("/mux")
 def mux(request: MuxRequest, background_tasks: BackgroundTasks):
@@ -526,17 +423,15 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
 
     subs_path = os.path.join(tmpdir, "subs.srt")
 
-    video_render_path = os.path.join(tmpdir, "video_render.mp4")  # step 1 output (video-only)
-    output_path = os.path.join(tmpdir, "output.mp4")              # step 2 output (final)
+    # Step outputs
+    source_video_path = None
+    rendered_video_path = os.path.join(tmpdir, "video_only_render.mp4")  # loop + subs + trim, NO AUDIO
+    output_path = os.path.join(tmpdir, "output.mp4")
 
     try:
-        # 1) Download + normalize narration
+        # 1) Download + normalize narration (THIS is the only audio we will use)
         download_file(str(request.audio_url), raw_audio_path)
         normalize_narration(raw_audio_path, narration_path)
-        assert_audio_not_silent(narration_path)
-
-        if DEBUG_PROBES:
-            print("NARRATION PROBE:", ffprobe_streams(narration_path))
 
         # 2) Optional subtitles
         has_subs = False
@@ -544,13 +439,11 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
             download_file(str(request.subtitles_url), subs_path)
             has_subs = os.path.getsize(subs_path) > 0
 
-        # 3) Duration target
+        # 3) Duration based on narration
         narration_dur = get_duration_seconds(narration_path)
         total_duration = max(0.0, narration_dur + VIDEO_TAIL_SECONDS)
 
         # 4) Resolve video source (library or direct)
-        video_path: Optional[str] = None
-
         if request.library_folder:
             if not DROPBOX_TOKEN:
                 raise HTTPException(status_code=500, detail="library_folder used but DROPBOX_TOKEN is not set")
@@ -558,30 +451,28 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
             all_paths = dropbox_list_mp4_paths(request.library_folder)
             picked = stable_pick(all_paths, request.library_count, seed=str(request.audio_url))
 
-            keep_library_audio = bool(request.include_ambience)
             clean_paths: List[str] = []
-
             for i, p in enumerate(picked):
                 link = dropbox_temp_link(p)
                 raw = os.path.join(tmpdir, f"lib_{i}.mp4")
                 clean = os.path.join(tmpdir, f"lib_{i}_clean.mp4")
                 download_file(link, raw)
-                normalize_clip(raw, clean, keep_audio=keep_library_audio)
+                normalize_clip_video_only(raw, clean)  # IMPORTANT: video-only
                 clean_paths.append(clean)
 
-            joined = os.path.join(tmpdir, "library_joined.mp4")
-            concat_library(clean_paths, joined_out=joined, keep_audio=keep_library_audio)
-            video_path = joined
+            joined = os.path.join(tmpdir, "library_joined_video_only.mp4")
+            concat_library_video_only(clean_paths, joined_out=joined)
+            source_video_path = joined
 
         if request.video_url:
-            video_path = os.path.join(tmpdir, "video.mp4")
-            download_file(str(request.video_url), video_path)
+            source_video_path = os.path.join(tmpdir, "video.mp4")
+            download_file(str(request.video_url), source_video_path)
 
-        if not video_path:
+        if not source_video_path:
             raise HTTPException(status_code=400, detail="Provide video_url or library_folder")
 
-        # 5) Subtitle filter
-        vf_arg = None
+        # 5) Subtitle styling per profile
+        vf_subs = None
         if has_subs:
             if request.subtitle_profile == "bible":
                 font_name = request.subtitle_font or "DejaVu Sans"
@@ -605,26 +496,31 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
                 f"MarginV={margin_v},"
                 f"Alignment=2"
             )
-            vf_arg = f"subtitles={subs_path}:force_style='{style}'"
+            vf_subs = f"subtitles={subs_path}:force_style='{style}'"
 
-        # ============================
-        # STEP 1: render VIDEO ONLY
-        # ============================
-        step1_cmd = [
+        # ----------------------------
+        # STEP A: render VIDEO-ONLY (explicitly no audio)
+        # ----------------------------
+        # Loop the video to narration length, apply subs, normalize scale/fps/pixfmt, strip audio.
+        vf_chain = []
+        if vf_subs:
+            vf_chain.append(vf_subs)
+        vf_chain.append(f"scale={TARGET_W}:{TARGET_H}")
+        vf_chain.append(f"fps={TARGET_FPS}")
+        vf_chain.append(f"format={TARGET_PIXFMT}")
+        vf_final = ",".join(vf_chain)
+
+        step_a = [
             "ffmpeg", "-y",
             "-stream_loop", "-1",
-            "-i", video_path,
+            "-i", source_video_path,
             "-t", f"{total_duration:.3f}",
             "-map_metadata", "-1",
-            "-map", "0:v:0",
-            "-an",
             "-fflags", "+genpts",
             "-avoid_negative_ts", "make_zero",
-            "-vf",
-            (
-                (vf_arg + ",") if vf_arg else ""
-            )
-            + f"scale={TARGET_W}:{TARGET_H},fps={TARGET_FPS},format={TARGET_PIXFMT}",
+            "-map", "0:v:0",
+            "-an",  # <- REMOVE ALL SOURCE AUDIO
+            "-vf", vf_final,
             "-fps_mode", "cfr",
             "-video_track_timescale", TARGET_TIMESCALE,
             "-c:v", "libx264",
@@ -632,96 +528,42 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
             "-pix_fmt", TARGET_PIXFMT,
             "-movflags", "+faststart",
             "-metadata:s:v:0", "handler_name=VideoHandler",
-            video_render_path,
+            rendered_video_path,
         ]
-        _run(step1_cmd, timeout=FFMPEG_TIMEOUT)
+        _run(step_a, timeout=FFMPEG_TIMEOUT)
+
+        # ----------------------------
+        # STEP B: mux narration as the ONLY audio
+        # ----------------------------
+        step_b = [
+            "ffmpeg", "-y",
+            "-i", rendered_video_path,
+            "-i", narration_path,
+            "-t", f"{total_duration:.3f}",
+            "-map_metadata", "-1",
+            "-fflags", "+genpts",
+            "-avoid_negative_ts", "make_zero",
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-profile:a", "aac_low",
+            "-b:a", NARRATION_AB,
+            "-ar", str(TARGET_AR),
+            "-ac", str(TARGET_AC),
+            "-metadata:s:v:0", "handler_name=VideoHandler",
+            "-metadata:s:a:0", "handler_name=SoundHandler",
+            "-metadata:s:a:0", "title=Narration",
+            "-disposition:a:0", "default",
+            "-movflags", "+faststart",
+            output_path,
+        ]
+        _run(step_b, timeout=FFMPEG_TIMEOUT)
 
         if DEBUG_PROBES:
-            print("VIDEO_RENDER PROBE:", ffprobe_streams(video_render_path))
-
-        # ============================
-        # STEP 2: add/mix AUDIO
-        # ============================
-        # If you want ambience, bring it from the ORIGINAL video (not the rendered one),
-        # because the rendered one is video-only.
-        has_amb = bool(request.include_ambience) and video_has_audio_stream(video_path)
-
-        if has_amb:
-            amb_vol = max(0.0, min(float(request.ambience_volume), 1.0))
-
-            step2_cmd = [
-                "ffmpeg", "-y",
-                "-i", video_render_path,   # 0: video-only
-                "-i", video_path,          # 1: original video for ambience audio
-                "-i", narration_path,      # 2: narration
-                "-t", f"{total_duration:.3f}",
-                "-map_metadata", "-1",
-                "-fflags", "+genpts",
-                "-avoid_negative_ts", "make_zero",
-                "-filter_complex",
-                (
-                    f"[1:a]asetpts=PTS-STARTPTS,"
-                    f"aformat=sample_rates={TARGET_AR}:channel_layouts=stereo,"
-                    f"volume={amb_vol}[amb];"
-                    f"[2:a]asetpts=PTS-STARTPTS,"
-                    f"aformat=sample_rates={TARGET_AR}:channel_layouts=stereo,"
-                    f"volume={NARRATION_GAIN}[nar];"
-                    f"[amb][nar]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=250[ducked];"
-                    f"[ducked][nar]amix=inputs=2:duration=first:dropout_transition=2,"
-                    f"alimiter=limit=0.95[aout]"
-                ),
-                "-map", "0:v:0",
-                "-map", "[aout]",
-                "-c:v", "copy",
-                "-c:a", "aac",
-                "-profile:a", "aac_low",
-                "-b:a", NARRATION_AB,
-                "-ar", str(TARGET_AR),
-                "-ac", str(TARGET_AC),
-                "-metadata:s:v:0", "handler_name=VideoHandler",
-                "-metadata:s:a:0", "handler_name=SoundHandler",
-                "-metadata:s:a:0", "title=Narration",
-                "-disposition:a:0", "default",
-                "-movflags", "+faststart",
-                output_path,
-            ]
-        else:
-            # Narration only (no ambience)
-            step2_cmd = [
-                "ffmpeg", "-y",
-                "-i", video_render_path,
-                "-i", narration_path,
-                "-t", f"{total_duration:.3f}",
-                "-map_metadata", "-1",
-                "-fflags", "+genpts",
-                "-avoid_negative_ts", "make_zero",
-                "-map", "0:v:0",
-                "-map", "1:a:0",
-                "-c:v", "copy",
-                "-c:a", "aac",
-                "-profile:a", "aac_low",
-                "-b:a", NARRATION_AB,
-                "-ar", str(TARGET_AR),
-                "-ac", str(TARGET_AC),
-                # PROOF BOOST:
-                "-af", f"asetpts=PTS-STARTPTS,volume={NARRATION_GAIN}",
-                "-metadata:s:v:0", "handler_name=VideoHandler",
-                "-metadata:s:a:0", "handler_name=SoundHandler",
-                "-metadata:s:a:0", "title=Narration",
-                "-disposition:a:0", "default",
-                "-movflags", "+faststart",
-                output_path,
-            ]
-
-        _run(step2_cmd, timeout=FFMPEG_TIMEOUT)
-
-        if DEBUG_PROBES:
+            print("RENDERED VIDEO PROBE:", ffprobe_streams(rendered_video_path))
+            print("NARRATION PROBE:", ffprobe_streams(narration_path))
             print("OUTPUT PROBE:", ffprobe_streams(output_path))
-            # Extra: extract final audio track to prove it contains sound
-            extracted = os.path.join(tmpdir, "extracted_audio.m4a")
-            _run(["ffmpeg", "-y", "-i", output_path, "-map", "0:a:0", "-c", "copy", extracted], timeout=300)
-            print("EXTRACTED AUDIO PROBE:", ffprobe_streams(extracted))
-            assert_audio_not_silent(extracted)
 
         return FileResponse(output_path, media_type="video/mp4", filename=f"final_{job_id}.mp4")
 
