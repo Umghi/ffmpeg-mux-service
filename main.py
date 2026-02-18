@@ -17,20 +17,22 @@ app = FastAPI()
 # Config
 # ----------------------------
 DOWNLOAD_TIMEOUT = 180          # seconds per file download
-FFMPEG_TIMEOUT = 2400           # seconds (library concat can take time)
+FFMPEG_TIMEOUT = 2400           # seconds
 MAX_BYTES = int(os.getenv("MAX_BYTES", str(300 * 1024 * 1024)))  # 300MB default
 VIDEO_TAIL_SECONDS = 1.0
 
-# Normalization target (match your Grok outputs)
+# Target normalization (match your Grok outputs)
 TARGET_W = 720
 TARGET_H = 1280
 TARGET_FPS = 24
 TARGET_PIXFMT = "yuv420p"
-TARGET_TIMESCALE = "60000"  # helps avoid "timescale not set" quirks
+TARGET_TIMESCALE = "60000"
 
+# Audio targets
 TARGET_AR = 44100
 TARGET_AC = 2
 TARGET_AB = "128k"
+NARRATION_AB = "192k"
 
 DROPBOX_TOKEN = os.getenv("DROPBOX_TOKEN", "").strip()
 
@@ -51,12 +53,12 @@ class MuxRequest(BaseModel):
     library_folder: Optional[str] = None   # Dropbox path like "/BIBLE/BibleLibrary/jerusalem_vertical/"
     library_count: int = 10                # how many clips to fetch
 
-    # Ambience mixing controls (Option B)
-    include_ambience: bool = True          # if input video has audio, mix it under narration
-    ambience_volume: float = 0.12          # ambience gain before ducking (0.08–0.18 typical)
+    # Ambience mixing controls
+    include_ambience: bool = True
+    ambience_volume: float = 0.12
 
-    transition: str = "fadeblack"          # currently not used (kept for compatibility)
-    transition_duration: float = 0.35      # currently not used (kept for compatibility)
+    transition: str = "fadeblack"          # currently not used
+    transition_duration: float = 0.35      # currently not used
 
 
 # ----------------------------
@@ -74,7 +76,6 @@ def _looks_like_html(first_bytes: bytes) -> bool:
 def _normalize_dropbox_url(url: str) -> str:
     """
     Converts www.dropbox.com shared links to dl=1 direct download.
-    Works for both ?dl=0 and ?dl=1 cases.
     """
     parsed = urlparse(url)
     host = parsed.netloc.lower()
@@ -162,7 +163,10 @@ def dropbox_temp_link(path: str) -> str:
     r = requests.post(url, headers=_dbx_headers(), json={"path": path}, timeout=30)
     if r.status_code != 200:
         raise HTTPException(status_code=400, detail=f"Dropbox get_temporary_link failed: {r.text}")
-    return r.json().get("link")
+    link = r.json().get("link")
+    if not link:
+        raise HTTPException(status_code=400, detail="Dropbox temp link missing in response")
+    return link
 
 
 def stable_pick(paths: List[str], count: int, seed: str) -> List[str]:
@@ -172,7 +176,6 @@ def stable_pick(paths: List[str], count: int, seed: str) -> List[str]:
     if count <= 0:
         return []
     paths = list(paths)
-    # simple deterministic offset
     h = 2166136261
     for ch in seed:
         h ^= ord(ch)
@@ -237,6 +240,28 @@ def video_has_audio_stream(path: str) -> bool:
         return False
 
 
+def normalize_narration(src_audio: str, dst_m4a: str) -> None:
+    """
+    ElevenLabs audio can be mono / odd sample rates / weird timestamps.
+    Normalize to stable AAC with clean timestamps + stereo + TARGET_AR.
+    """
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", src_audio,
+        "-vn",
+        "-fflags", "+genpts",
+        "-avoid_negative_ts", "make_zero",
+        "-af", f"aresample={TARGET_AR}:async=1, aformat=channel_layouts=stereo",
+        "-ac", str(TARGET_AC),
+        "-ar", str(TARGET_AR),
+        "-c:a", "aac",
+        "-b:a", NARRATION_AB,
+        "-movflags", "+faststart",
+        dst_m4a,
+    ]
+    _run(cmd, timeout=FFMPEG_TIMEOUT)
+
+
 def normalize_clip(src_mp4: str, dst_mp4: str, keep_audio: bool) -> None:
     """
     Make every library clip concat-safe:
@@ -245,9 +270,10 @@ def normalize_clip(src_mp4: str, dst_mp4: str, keep_audio: bool) -> None:
     - forces track timescale
     - optionally keeps + normalizes audio (for ambience mixing later)
     """
+    dur = get_duration_seconds(src_mp4)
+
     if keep_audio:
         has_a = video_has_audio_stream(src_mp4)
-        dur = get_duration_seconds(src_mp4)
 
         if has_a:
             cmd = [
@@ -257,13 +283,15 @@ def normalize_clip(src_mp4: str, dst_mp4: str, keep_audio: bool) -> None:
                 "-map", "0:a:0",
                 "-sn", "-dn",
                 "-map_metadata", "-1",
+                "-fflags", "+genpts",
+                "-avoid_negative_ts", "make_zero",
                 "-vf", f"scale={TARGET_W}:{TARGET_H},fps={TARGET_FPS},format={TARGET_PIXFMT}",
                 "-fps_mode", "cfr",
                 "-video_track_timescale", TARGET_TIMESCALE,
                 "-c:v", "libx264",
                 "-preset", "veryfast",
                 "-pix_fmt", TARGET_PIXFMT,
-                "-af", f"aresample={TARGET_AR}:async=1",
+                "-af", f"aresample={TARGET_AR}:async=1, aformat=channel_layouts=stereo",
                 "-ac", str(TARGET_AC),
                 "-ar", str(TARGET_AR),
                 "-c:a", "aac",
@@ -273,7 +301,7 @@ def normalize_clip(src_mp4: str, dst_mp4: str, keep_audio: bool) -> None:
                 dst_mp4,
             ]
         else:
-            # Generate silent audio if clip has no audio, so concat doesn't break
+            # Generate silent audio so concat stays consistent
             cmd = [
                 "ffmpeg", "-y",
                 "-i", src_mp4,
@@ -283,6 +311,8 @@ def normalize_clip(src_mp4: str, dst_mp4: str, keep_audio: bool) -> None:
                 "-map", "1:a:0",
                 "-sn", "-dn",
                 "-map_metadata", "-1",
+                "-fflags", "+genpts",
+                "-avoid_negative_ts", "make_zero",
                 "-vf", f"scale={TARGET_W}:{TARGET_H},fps={TARGET_FPS},format={TARGET_PIXFMT}",
                 "-fps_mode", "cfr",
                 "-video_track_timescale", TARGET_TIMESCALE,
@@ -296,13 +326,14 @@ def normalize_clip(src_mp4: str, dst_mp4: str, keep_audio: bool) -> None:
                 dst_mp4,
             ]
     else:
-        # Video-only normalization (most robust)
         cmd = [
             "ffmpeg", "-y",
             "-i", src_mp4,
             "-map", "0:v:0",
             "-an", "-sn", "-dn",
             "-map_metadata", "-1",
+            "-fflags", "+genpts",
+            "-avoid_negative_ts", "make_zero",
             "-vf", f"scale={TARGET_W}:{TARGET_H},fps={TARGET_FPS},format={TARGET_PIXFMT}",
             "-fps_mode", "cfr",
             "-video_track_timescale", TARGET_TIMESCALE,
@@ -319,7 +350,6 @@ def normalize_clip(src_mp4: str, dst_mp4: str, keep_audio: bool) -> None:
 def concat_library(clean_paths: List[str], joined_out: str, keep_audio: bool) -> None:
     """
     Concat using concat demuxer and re-encode once.
-    If keep_audio=True, re-encodes audio too.
     """
     list_path = os.path.join(os.path.dirname(joined_out), "concat_list.txt")
     with open(list_path, "w", encoding="utf-8") as f:
@@ -331,6 +361,8 @@ def concat_library(clean_paths: List[str], joined_out: str, keep_audio: bool) ->
         "-f", "concat",
         "-safe", "0",
         "-i", list_path,
+        "-fflags", "+genpts",
+        "-avoid_negative_ts", "make_zero",
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-pix_fmt", TARGET_PIXFMT,
@@ -479,13 +511,17 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
     job_id = uuid.uuid4().hex
     tmpdir = tempfile.mkdtemp(prefix=f"mux_{job_id}_")
 
-    audio_path = os.path.join(tmpdir, "narration.mp3")
+    raw_audio_path = os.path.join(tmpdir, "narration_raw.mp3")
+    audio_path = os.path.join(tmpdir, "narration_norm.m4a")
     subs_path = os.path.join(tmpdir, "subs.srt")
     output_path = os.path.join(tmpdir, "output.mp4")
 
     try:
         # 1) Download narration
-        download_file(str(request.audio_url), audio_path)
+        download_file(str(request.audio_url), raw_audio_path)
+
+        # 1b) Normalize narration (critical for ElevenLabs)
+        normalize_narration(raw_audio_path, audio_path)
 
         # 2) Optional subtitles
         has_subs = False
@@ -498,7 +534,7 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
         total_duration = max(0.0, narration_dur + VIDEO_TAIL_SECONDS)
 
         # 4) Resolve video source
-        video_path = None
+        video_path: Optional[str] = None
 
         # Library mode: download N clips from Dropbox, normalize, concat
         if request.library_folder:
@@ -508,10 +544,9 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
             all_paths = dropbox_list_mp4_paths(request.library_folder)
             picked = stable_pick(all_paths, request.library_count, seed=str(request.audio_url))
 
-            raw_paths: List[str] = []
             clean_paths: List[str] = []
 
-            # If we plan to include ambience, we must keep audio through normalization+concat
+            # If mixing ambience, keep audio through normalization+concat
             keep_library_audio = bool(request.include_ambience)
 
             for i, p in enumerate(picked):
@@ -520,7 +555,6 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
                 clean = os.path.join(tmpdir, f"lib_{i}_clean.mp4")
                 download_file(link, raw)
                 normalize_clip(raw, clean, keep_audio=keep_library_audio)
-                raw_paths.append(raw)
                 clean_paths.append(clean)
 
             joined = os.path.join(tmpdir, "library_joined.mp4")
@@ -560,19 +594,22 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
                 f"MarginV={margin_v},"
                 f"Alignment=2"
             )
+            # Note: quote carefully; force_style uses ASS syntax
             vf_arg = f"subtitles={subs_path}:force_style='{style}'"
 
         # 6) Build ffmpeg command:
         #    - ALWAYS use narration as primary
-        #    - Option B: mix ambience from video (if exists) under narration
-        has_video_audio = request.include_ambience and video_has_audio_stream(video_path)
+        #    - Option: mix ambience from video (if exists) under narration
+        has_video_audio = bool(request.include_ambience) and video_has_audio_stream(video_path)
 
         ffmpeg_cmd = [
             "ffmpeg", "-y",
             "-stream_loop", "-1",
             "-i", video_path,   # input 0
-            "-i", audio_path,   # input 1
+            "-i", audio_path,   # input 1 (normalized narration)
             "-t", f"{total_duration:.3f}",
+            "-fflags", "+genpts",
+            "-avoid_negative_ts", "make_zero",
         ]
 
         # Video encode args
@@ -591,11 +628,13 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
             # - duck ambience when narration present
             # - limiter to avoid clipping
             amb_vol = max(0.0, min(float(request.ambience_volume), 1.0))
+
             audio_filter = (
                 f"[0:a]aformat=sample_rates={TARGET_AR}:channel_layouts=stereo,volume={amb_vol}[amb];"
                 f"[1:a]aformat=sample_rates={TARGET_AR}:channel_layouts=stereo,volume=1.0[nar];"
                 f"[amb][nar]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=250[ducked];"
-                f"[ducked][nar]amix=inputs=2:duration=first:dropout_transition=2,alimiter=limit=0.95[aout]"
+                f"[ducked][nar]amix=inputs=2:duration=first:dropout_transition=2,"
+                f"alimiter=limit=0.95[aout]"
             )
 
             ffmpeg_cmd += [
@@ -603,7 +642,9 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
                 "-map", "0:v:0",
                 "-map", "[aout]",
                 "-c:a", "aac",
-                "-b:a", "192k",
+                "-b:a", NARRATION_AB,
+                "-ar", str(TARGET_AR),
+                "-ac", str(TARGET_AC),
             ] + video_out_args + [output_path]
         else:
             # Narration only (video audio stripped)
@@ -611,10 +652,21 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
                 "-map", "0:v:0",
                 "-map", "1:a:0",
                 "-c:a", "aac",
-                "-b:a", "192k",
+                "-b:a", NARRATION_AB,
+                "-ar", str(TARGET_AR),
+                "-ac", str(TARGET_AC),
+                "-af", f"aresample={TARGET_AR}:async=1",
             ] + video_out_args + [output_path]
 
         _run(ffmpeg_cmd, timeout=FFMPEG_TIMEOUT)
+
+        # Optional: sanity check (uncomment while debugging)
+        # probe = subprocess.check_output([
+        #     "ffprobe", "-hide_banner", "-v", "error",
+        #     "-show_streams", "-select_streams", "a",
+        #     "-of", "json", output_path
+        # ], timeout=30).decode()
+        # print("OUTPUT AUDIO STREAMS:", probe)
 
         return FileResponse(output_path, media_type="video/mp4", filename=f"final_{job_id}.mp4")
 
