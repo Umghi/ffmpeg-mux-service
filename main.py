@@ -3,7 +3,6 @@ import uuid
 import shutil
 import tempfile
 import subprocess
-import random
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
@@ -18,18 +17,23 @@ app = FastAPI()
 # Config
 # ----------------------------
 DOWNLOAD_TIMEOUT = 180          # seconds per file download
-FFMPEG_TIMEOUT = 1800           # seconds (library concat can take time)
-MAX_BYTES = 300 * 1024 * 1024   # 300MB safety limit
+FFMPEG_TIMEOUT = 2400           # seconds (library concat can take time)
+MAX_BYTES = int(os.getenv("MAX_BYTES", str(300 * 1024 * 1024)))  # 300MB default
 VIDEO_TAIL_SECONDS = 1.0
 
-# Library normalisation target (match your vertical source)
+# Normalization target (match your Grok outputs)
 TARGET_W = 720
 TARGET_H = 1280
 TARGET_FPS = 24
 TARGET_PIXFMT = "yuv420p"
 TARGET_TIMESCALE = "60000"  # helps avoid "timescale not set" quirks
 
-DROPBOX_ACCESS_TOKEN = os.getenv("DROPBOX_ACCESS_TOKEN")
+TARGET_AR = 44100
+TARGET_AC = 2
+TARGET_AB = "128k"
+
+DROPBOX_TOKEN = os.getenv("DROPBOX_TOKEN", "").strip()
+
 
 # ----------------------------
 # Request models
@@ -45,13 +49,18 @@ class MuxRequest(BaseModel):
     subtitle_font_size: Optional[int] = None
 
     library_folder: Optional[str] = None   # Dropbox path like "/BIBLE/BibleLibrary/jerusalem_vertical/"
-    library_count: int = 10                # max unique clips to sample from
-    transition: str = "fadeblack"          # fadeblack supported
-    transition_duration: float = 0.5      # seconds
+    library_count: int = 10                # how many clips to fetch
+
+    # Ambience mixing controls (Option B)
+    include_ambience: bool = True          # if input video has audio, mix it under narration
+    ambience_volume: float = 0.12          # ambience gain before ducking (0.08–0.18 typical)
+
+    transition: str = "fadeblack"          # currently not used (kept for compatibility)
+    transition_duration: float = 0.35      # currently not used (kept for compatibility)
 
 
 # ----------------------------
-# Helpers: download (public URLs)
+# Helpers: download
 # ----------------------------
 def _looks_like_html(first_bytes: bytes) -> bool:
     s = first_bytes.lstrip().lower()
@@ -63,6 +72,10 @@ def _looks_like_html(first_bytes: bytes) -> bool:
 
 
 def _normalize_dropbox_url(url: str) -> str:
+    """
+    Converts www.dropbox.com shared links to dl=1 direct download.
+    Works for both ?dl=0 and ?dl=1 cases.
+    """
     parsed = urlparse(url)
     host = parsed.netloc.lower()
     if "dropbox.com" not in host:
@@ -92,7 +105,7 @@ def download_file(url: str, dest_path: str) -> None:
                         if _looks_like_html(chunk[:4096]):
                             raise HTTPException(
                                 status_code=400,
-                                detail="Downloaded HTML instead of media. Check Dropbox link permissions / dl=1."
+                                detail="Downloaded HTML instead of media. Check link permissions / dl=1."
                             )
 
                     total += len(chunk)
@@ -109,105 +122,71 @@ def download_file(url: str, dest_path: str) -> None:
 
 
 # ----------------------------
-# Helpers: Dropbox (API)
+# Helpers: Dropbox library
 # ----------------------------
-def _dbx_headers_json() -> Dict[str, str]:
-    if not DROPBOX_ACCESS_TOKEN:
-        raise HTTPException(status_code=500, detail="DROPBOX_ACCESS_TOKEN not set on server")
+def _dbx_headers() -> Dict[str, str]:
+    if not DROPBOX_TOKEN:
+        raise HTTPException(status_code=500, detail="DROPBOX_TOKEN not set")
     return {
-        "Authorization": f"Bearer {DROPBOX_ACCESS_TOKEN}",
+        "Authorization": f"Bearer {DROPBOX_TOKEN}",
         "Content-Type": "application/json",
     }
 
 
-def dropbox_list_folder_mp4s(folder_path: str) -> List[str]:
+def dropbox_list_mp4_paths(folder: str) -> List[str]:
     """
-    Returns Dropbox paths (lowercase) for mp4 files in the folder.
-    Requires scopes:
-      - files.metadata.read
+    Returns a list of Dropbox file paths for .mp4 items in folder (non-recursive).
     """
     url = "https://api.dropboxapi.com/2/files/list_folder"
-    headers = _dbx_headers_json()
-
-    files: List[str] = []
-    payload: Dict[str, Any] = {"path": folder_path, "recursive": False, "include_non_downloadable_files": False}
-
-    r = requests.post(url, headers=headers, json=payload, timeout=30)
-    if r.status_code >= 400:
+    body = {"path": folder, "recursive": False, "include_media_info": False}
+    r = requests.post(url, headers=_dbx_headers(), json=body, timeout=30)
+    if r.status_code != 200:
         raise HTTPException(status_code=400, detail=f"Dropbox list_folder failed: {r.text}")
 
     data = r.json()
-    while True:
-        for e in data.get("entries", []):
-            if e.get(".tag") == "file" and str(e.get("name", "")).lower().endswith(".mp4"):
-                # path_lower is safest to reuse
-                files.append(e.get("path_lower"))
+    entries = data.get("entries", [])
+    out = []
+    for e in entries:
+        if e.get(".tag") == "file":
+            p = e.get("path_lower") or e.get("path_display")
+            if p and p.lower().endswith(".mp4"):
+                out.append(p)
 
-        if not data.get("has_more"):
-            break
-
-        cursor = data.get("cursor")
-        if not cursor:
-            break
-
-        r2 = requests.post(
-            "https://api.dropboxapi.com/2/files/list_folder/continue",
-            headers=headers,
-            json={"cursor": cursor},
-            timeout=30,
-        )
-        if r2.status_code >= 400:
-            raise HTTPException(status_code=400, detail=f"Dropbox list_folder/continue failed: {r2.text}")
-        data = r2.json()
-
-    # Filter out any Nones
-    return [p for p in files if p]
+    if not out:
+        raise HTTPException(status_code=400, detail=f"No .mp4 files found in Dropbox folder: {folder}")
+    return out
 
 
-def dropbox_download_path(dbx_path: str, dest_path: str) -> None:
+def dropbox_temp_link(path: str) -> str:
+    url = "https://api.dropboxapi.com/2/files/get_temporary_link"
+    r = requests.post(url, headers=_dbx_headers(), json={"path": path}, timeout=30)
+    if r.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"Dropbox get_temporary_link failed: {r.text}")
+    return r.json().get("link")
+
+
+def stable_pick(paths: List[str], count: int, seed: str) -> List[str]:
     """
-    Downloads a Dropbox file by path into dest_path.
-    Requires scopes:
-      - files.content.read
+    Deterministic selection: hash seed -> rotates list.
     """
-    if not DROPBOX_ACCESS_TOKEN:
-        raise HTTPException(status_code=500, detail="DROPBOX_ACCESS_TOKEN not set on server")
-
-    url = "https://content.dropboxapi.com/2/files/download"
-    headers = {
-        "Authorization": f"Bearer {DROPBOX_ACCESS_TOKEN}",
-        "Dropbox-API-Arg": f'{{"path": "{dbx_path}"}}',
-    }
-
-    try:
-        with requests.post(url, headers=headers, stream=True, timeout=DOWNLOAD_TIMEOUT) as r:
-            if r.status_code >= 400:
-                raise HTTPException(status_code=400, detail=f"Dropbox download failed: {r.text}")
-
-            total = 0
-            wrote_any = False
-            with open(dest_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    if not chunk:
-                        continue
-                    if not wrote_any:
-                        wrote_any = True
-                    total += len(chunk)
-                    if total > MAX_BYTES:
-                        raise HTTPException(status_code=413, detail="Library clip too large")
-                    f.write(chunk)
-
-            if not wrote_any:
-                raise HTTPException(status_code=400, detail="Dropbox download returned empty file")
-
-    except requests.RequestException as e:
-        raise HTTPException(status_code=400, detail=f"Dropbox download request failed: {e}")
+    if count <= 0:
+        return []
+    paths = list(paths)
+    # simple deterministic offset
+    h = 2166136261
+    for ch in seed:
+        h ^= ord(ch)
+        h = (h * 16777619) & 0xFFFFFFFF
+    offset = h % len(paths)
+    rotated = paths[offset:] + paths[:offset]
+    return rotated[: min(count, len(rotated))]
 
 
 # ----------------------------
 # Helpers: ffmpeg/ffprobe
 # ----------------------------
 def _run(cmd: List[str], timeout: int = FFMPEG_TIMEOUT) -> str:
+    """Run a subprocess and return stderr tail. Raises on failure."""
     try:
         proc = subprocess.run(
             cmd,
@@ -220,7 +199,7 @@ def _run(cmd: List[str], timeout: int = FFMPEG_TIMEOUT) -> str:
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=504, detail="ffmpeg timed out")
     except subprocess.CalledProcessError as e:
-        tail = e.stderr.decode(errors="ignore")[-12000:]
+        tail = e.stderr.decode(errors="ignore")[-8000:]
         raise HTTPException(status_code=500, detail=f"ffmpeg failed: {tail}")
 
 
@@ -243,54 +222,104 @@ def get_duration_seconds(path: str) -> float:
         raise HTTPException(status_code=500, detail=f"ffprobe failed: {e}")
 
 
-def normalize_clip(
-    src_mp4: str,
-    dst_mp4: str,
-    fade_in: float = 0.0,
-    fade_out: float = 0.0
-) -> None:
-    """
-    Make every library clip identical for concat:
-    - keep ONLY video stream
-    - remove attachments/subs/data (fixes 'attached pic' mjpeg streams)
-    - force scale, fps (CFR), pix_fmt
-    - force track timescale
-    - optional fade in/out to black
-    """
-    # We need duration for fade-out timing
-    dur = get_duration_seconds(src_mp4)
-    vf_parts = [f"scale={TARGET_W}:{TARGET_H}", f"fps={TARGET_FPS}", f"format={TARGET_PIXFMT}"]
-
-    if fade_in and fade_in > 0:
-        vf_parts.append(f"fade=t=in:st=0:d={fade_in}")
-
-    if fade_out and fade_out > 0 and dur > (fade_out + 0.05):
-        st = max(0.0, dur - fade_out)
-        vf_parts.append(f"fade=t=out:st={st}:d={fade_out}")
-
-    vf = ",".join(vf_parts)
-
+def video_has_audio_stream(path: str) -> bool:
     cmd = [
-        "ffmpeg", "-y",
-        "-i", src_mp4,
-        "-map", "0:v:0",
-        "-an", "-sn", "-dn",
-        "-map_metadata", "-1",
-        "-vf", vf,
-        "-fps_mode", "cfr",
-        "-video_track_timescale", TARGET_TIMESCALE,
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-pix_fmt", TARGET_PIXFMT,
-        "-movflags", "+faststart",
-        dst_mp4,
+        "ffprobe", "-v", "error",
+        "-select_streams", "a:0",
+        "-show_entries", "stream=index",
+        "-of", "csv=p=0",
+        path
     ]
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=15).decode().strip()
+        return out != ""
+    except Exception:
+        return False
+
+
+def normalize_clip(src_mp4: str, dst_mp4: str, keep_audio: bool) -> None:
+    """
+    Make every library clip concat-safe:
+    - strips attachments/subs/data
+    - forces scale, fps (CFR), pix_fmt
+    - forces track timescale
+    - optionally keeps + normalizes audio (for ambience mixing later)
+    """
+    if keep_audio:
+        has_a = video_has_audio_stream(src_mp4)
+        dur = get_duration_seconds(src_mp4)
+
+        if has_a:
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", src_mp4,
+                "-map", "0:v:0",
+                "-map", "0:a:0",
+                "-sn", "-dn",
+                "-map_metadata", "-1",
+                "-vf", f"scale={TARGET_W}:{TARGET_H},fps={TARGET_FPS},format={TARGET_PIXFMT}",
+                "-fps_mode", "cfr",
+                "-video_track_timescale", TARGET_TIMESCALE,
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-pix_fmt", TARGET_PIXFMT,
+                "-af", f"aresample={TARGET_AR}:async=1",
+                "-ac", str(TARGET_AC),
+                "-ar", str(TARGET_AR),
+                "-c:a", "aac",
+                "-b:a", TARGET_AB,
+                "-t", f"{dur:.3f}",
+                "-movflags", "+faststart",
+                dst_mp4,
+            ]
+        else:
+            # Generate silent audio if clip has no audio, so concat doesn't break
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", src_mp4,
+                "-f", "lavfi",
+                "-i", f"anullsrc=channel_layout=stereo:sample_rate={TARGET_AR}",
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                "-sn", "-dn",
+                "-map_metadata", "-1",
+                "-vf", f"scale={TARGET_W}:{TARGET_H},fps={TARGET_FPS},format={TARGET_PIXFMT}",
+                "-fps_mode", "cfr",
+                "-video_track_timescale", TARGET_TIMESCALE,
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-pix_fmt", TARGET_PIXFMT,
+                "-c:a", "aac",
+                "-b:a", TARGET_AB,
+                "-t", f"{dur:.3f}",
+                "-movflags", "+faststart",
+                dst_mp4,
+            ]
+    else:
+        # Video-only normalization (most robust)
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", src_mp4,
+            "-map", "0:v:0",
+            "-an", "-sn", "-dn",
+            "-map_metadata", "-1",
+            "-vf", f"scale={TARGET_W}:{TARGET_H},fps={TARGET_FPS},format={TARGET_PIXFMT}",
+            "-fps_mode", "cfr",
+            "-video_track_timescale", TARGET_TIMESCALE,
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-pix_fmt", TARGET_PIXFMT,
+            "-movflags", "+faststart",
+            dst_mp4,
+        ]
+
     _run(cmd, timeout=FFMPEG_TIMEOUT)
 
 
-def concat_library(clean_paths: List[str], joined_out: str) -> None:
+def concat_library(clean_paths: List[str], joined_out: str, keep_audio: bool) -> None:
     """
-    Concat using concat demuxer (reliable) and re-encode once.
+    Concat using concat demuxer and re-encode once.
+    If keep_audio=True, re-encodes audio too.
     """
     list_path = os.path.join(os.path.dirname(joined_out), "concat_list.txt")
     with open(list_path, "w", encoding="utf-8") as f:
@@ -302,13 +331,23 @@ def concat_library(clean_paths: List[str], joined_out: str) -> None:
         "-f", "concat",
         "-safe", "0",
         "-i", list_path,
-        "-vf", f"format={TARGET_PIXFMT}",
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-pix_fmt", TARGET_PIXFMT,
         "-movflags", "+faststart",
-        joined_out,
     ]
+
+    if keep_audio:
+        cmd += [
+            "-c:a", "aac",
+            "-b:a", TARGET_AB,
+            "-ar", str(TARGET_AR),
+            "-ac", str(TARGET_AC),
+        ]
+    else:
+        cmd += ["-an"]
+
+    cmd.append(joined_out)
     _run(cmd, timeout=FFMPEG_TIMEOUT)
 
 
@@ -349,8 +388,8 @@ def _extract_words_from_payload(payload: Any) -> List[Dict[str, Any]]:
 
 def words_to_captions(words: List[Dict[str, Any]], profile: str) -> List[Dict[str, Any]]:
     if profile == "bible":
-        max_chars = 75
-        max_words = 16
+        max_chars = 54
+        max_words = 11
         max_duration = 3.2
         min_duration = 0.6
     else:
@@ -422,14 +461,6 @@ def srt_from_stt(payload: Any = Body(...), profile: str = "menopause"):
     return PlainTextResponse(content=captions_to_srt(captions), media_type="text/plain")
 
 
-@app.get("/health", response_class=PlainTextResponse)
-def health():
-    return PlainTextResponse("ok")
-
-
-# ----------------------------
-# Fonts helper endpoint
-# ----------------------------
 @app.get("/fonts", response_class=PlainTextResponse)
 def list_fonts():
     try:
@@ -448,95 +479,68 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
     job_id = uuid.uuid4().hex
     tmpdir = tempfile.mkdtemp(prefix=f"mux_{job_id}_")
 
-    audio_path = os.path.join(tmpdir, "audio.mp3")
+    audio_path = os.path.join(tmpdir, "narration.mp3")
     subs_path = os.path.join(tmpdir, "subs.srt")
     output_path = os.path.join(tmpdir, "output.mp4")
 
     try:
-        # 1) download audio
+        # 1) Download narration
         download_file(str(request.audio_url), audio_path)
 
-        # 2) subtitles (optional)
+        # 2) Optional subtitles
         has_subs = False
         if request.subtitles_url:
             download_file(str(request.subtitles_url), subs_path)
             has_subs = os.path.getsize(subs_path) > 0
 
-        # 3) duration
-        audio_duration = get_duration_seconds(audio_path)
-        total_duration = max(0.0, audio_duration + VIDEO_TAIL_SECONDS)
+        # 3) Compute final duration
+        narration_dur = get_duration_seconds(audio_path)
+        total_duration = max(0.0, narration_dur + VIDEO_TAIL_SECONDS)
 
-        # 4) Choose video source:
-        #    A) library mode -> build joined video bed
-        #    B) direct video_url -> use it
+        # 4) Resolve video source
         video_path = None
 
+        # Library mode: download N clips from Dropbox, normalize, concat
         if request.library_folder:
-            if request.transition != "fadeblack":
-                raise HTTPException(status_code=400, detail="Only transition='fadeblack' is supported currently")
+            if not DROPBOX_TOKEN:
+                raise HTTPException(status_code=500, detail="library_folder used but DROPBOX_TOKEN is not set")
 
-            # list available clips
-            mp4_paths = dropbox_list_folder_mp4s(request.library_folder)
-            if not mp4_paths:
-                raise HTTPException(status_code=400, detail="No .mp4 files found in library_folder")
+            all_paths = dropbox_list_mp4_paths(request.library_folder)
+            picked = stable_pick(all_paths, request.library_count, seed=str(request.audio_url))
 
-            # sample pool (up to library_count unique)
-            pool_size = min(max(1, request.library_count), len(mp4_paths))
-            pool = random.sample(mp4_paths, pool_size)
-
-            # download + build enough clips to cover total_duration
+            raw_paths: List[str] = []
             clean_paths: List[str] = []
-            assembled = 0.0
 
-            # safety limit so we don't go wild
-            max_clips = 40
+            # If we plan to include ambience, we must keep audio through normalization+concat
+            keep_library_audio = bool(request.include_ambience)
 
-            i = 0
-            while assembled < total_duration and i < max_clips:
-                dbx_path = random.choice(pool)
-
-                raw_path = os.path.join(tmpdir, f"lib_{i}.mp4")
-                clean_path = os.path.join(tmpdir, f"lib_{i}_clean.mp4")
-
-                dropbox_download_path(dbx_path, raw_path)
-
-                # fade rules:
-                # - first clip: fade OUT only
-                # - middle clips: fade IN + fade OUT
-                # - last clip: we'll still fade out; final trim makes it OK
-                fade_in = request.transition_duration if i > 0 else 0.0
-                fade_out = request.transition_duration
-
-                normalize_clip(raw_path, clean_path, fade_in=fade_in, fade_out=fade_out)
-
-                d = get_duration_seconds(clean_path)
-                assembled += d
-                clean_paths.append(clean_path)
-                i += 1
-
-            if not clean_paths:
-                raise HTTPException(status_code=400, detail="Failed to prepare any library clips")
+            for i, p in enumerate(picked):
+                link = dropbox_temp_link(p)
+                raw = os.path.join(tmpdir, f"lib_{i}.mp4")
+                clean = os.path.join(tmpdir, f"lib_{i}_clean.mp4")
+                download_file(link, raw)
+                normalize_clip(raw, clean, keep_audio=keep_library_audio)
+                raw_paths.append(raw)
+                clean_paths.append(clean)
 
             joined = os.path.join(tmpdir, "library_joined.mp4")
-            concat_library(clean_paths, joined)
+            concat_library(clean_paths, joined_out=joined, keep_audio=keep_library_audio)
             video_path = joined
 
-        if request.video_url and not video_path:
+        # Direct video mode
+        if request.video_url:
             video_path = os.path.join(tmpdir, "video.mp4")
             download_file(str(request.video_url), video_path)
 
         if not video_path:
-            raise HTTPException(
-                status_code=400,
-                detail="video_url is required unless library_folder is provided."
-            )
+            raise HTTPException(status_code=400, detail="Provide video_url or library_folder")
 
         # 5) Subtitle styling per profile
         vf_arg = None
         if has_subs:
             if request.subtitle_profile == "bible":
                 font_name = request.subtitle_font or "DejaVu Sans"
-                font_size = request.subtitle_font_size or 16
+                font_size = request.subtitle_font_size or 28
                 margin_v = 90
                 outline = 3
             else:
@@ -558,34 +562,61 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
             )
             vf_arg = f"subtitles={subs_path}:force_style='{style}'"
 
-        # 6) Mux: loop video if it somehow comes short, then trim to audio duration
+        # 6) Build ffmpeg command:
+        #    - ALWAYS use narration as primary
+        #    - Option B: mix ambience from video (if exists) under narration
+        has_video_audio = request.include_ambience and video_has_audio_stream(video_path)
+
         ffmpeg_cmd = [
             "ffmpeg", "-y",
             "-stream_loop", "-1",
-            "-i", video_path,
-            "-i", audio_path,
-            "-map", "0:v:0",
-            "-map", "1:a:0",
+            "-i", video_path,   # input 0
+            "-i", audio_path,   # input 1
             "-t", f"{total_duration:.3f}",
+        ]
+
+        # Video encode args
+        video_out_args = [
             "-c:v", "libx264",
             "-preset", "veryfast",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-b:a", "192k",
+            "-pix_fmt", TARGET_PIXFMT,
             "-movflags", "+faststart",
         ]
         if vf_arg:
-            ffmpeg_cmd += ["-vf", vf_arg]
+            video_out_args = ["-vf", vf_arg] + video_out_args
 
-        ffmpeg_cmd.append(output_path)
+        if has_video_audio:
+            # Mix ambience with narration:
+            # - ambience volume low
+            # - duck ambience when narration present
+            # - limiter to avoid clipping
+            amb_vol = max(0.0, min(float(request.ambience_volume), 1.0))
+            audio_filter = (
+                f"[0:a]aformat=sample_rates={TARGET_AR}:channel_layouts=stereo,volume={amb_vol}[amb];"
+                f"[1:a]aformat=sample_rates={TARGET_AR}:channel_layouts=stereo,volume=1.0[nar];"
+                f"[amb][nar]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=250[ducked];"
+                f"[ducked][nar]amix=inputs=2:duration=first:dropout_transition=2,alimiter=limit=0.95[aout]"
+            )
+
+            ffmpeg_cmd += [
+                "-filter_complex", audio_filter,
+                "-map", "0:v:0",
+                "-map", "[aout]",
+                "-c:a", "aac",
+                "-b:a", "192k",
+            ] + video_out_args + [output_path]
+        else:
+            # Narration only (video audio stripped)
+            ffmpeg_cmd += [
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                "-c:a", "aac",
+                "-b:a", "192k",
+            ] + video_out_args + [output_path]
 
         _run(ffmpeg_cmd, timeout=FFMPEG_TIMEOUT)
 
-        # IMPORTANT: don't delete tmpdir until after response completes
-        background_tasks.add_task(shutil.rmtree, tmpdir, True)
         return FileResponse(output_path, media_type="video/mp4", filename=f"final_{job_id}.mp4")
 
-    except Exception:
-        # ensure cleanup on failure too
+    finally:
         background_tasks.add_task(shutil.rmtree, tmpdir, True)
-        raise
