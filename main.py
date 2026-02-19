@@ -72,10 +72,7 @@ def _refresh_dbx_access_token() -> None:
     r = requests.post(
         token_url,
         headers={"Authorization": f"Basic {basic}"},
-        data={
-            "grant_type": "refresh_token",
-            "refresh_token": DROPBOX_REFRESH_TOKEN,
-        },
+        data={"grant_type": "refresh_token", "refresh_token": DROPBOX_REFRESH_TOKEN},
         timeout=30,
     )
 
@@ -95,7 +92,6 @@ def _refresh_dbx_access_token() -> None:
             detail=f"Dropbox token refresh missing access_token: {payload}",
         )
 
-    # Some responses include expires_in; if absent, be conservative.
     ttl = int(expires_in) if expires_in else 1800
 
     global _dbx_access_token, _dbx_access_token_exp
@@ -225,19 +221,6 @@ def dropbox_temp_link(path: str) -> str:
     return link
 
 
-def stable_pick(paths: List[str], count: int, seed: str) -> List[str]:
-    if count <= 0:
-        return []
-    paths = list(paths)
-    h = 2166136261
-    for ch in seed:
-        h ^= ord(ch)
-        h = (h * 16777619) & 0xFFFFFFFF
-    offset = h % len(paths)
-    rotated = paths[offset:] + paths[:offset]
-    return rotated[: min(count, len(rotated))]
-
-
 # ----------------------------
 # Helpers: ffmpeg/ffprobe
 # ----------------------------
@@ -290,6 +273,12 @@ def get_duration_seconds(path: str) -> float:
 
 
 def normalize_narration(src_audio: str, dst_m4a: str) -> None:
+    """
+    Normalize narration to a clean, compatible AAC-LC track:
+    - timestamps start at 0
+    - stereo 44.1k
+    - loudness normalized (prevents "it's there but quiet")
+    """
     cmd = [
         "ffmpeg",
         "-y",
@@ -331,6 +320,9 @@ def normalize_narration(src_audio: str, dst_m4a: str) -> None:
 
 
 def normalize_clip_video_only(src_mp4: str, dst_mp4: str) -> None:
+    """
+    Normalize ONLY video (no audio) to be concat-safe.
+    """
     cmd = [
         "ffmpeg",
         "-y",
@@ -532,7 +524,7 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
 
     subs_path = os.path.join(tmpdir, "subs.srt")
 
-    source_video_path = None
+    source_video_path: Optional[str] = None
     rendered_video_path = os.path.join(tmpdir, "video_only_render.mp4")
     output_path = os.path.join(tmpdir, "output.mp4")
 
@@ -553,15 +545,15 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
 
         # 4) Resolve video source (library or direct)
         if request.library_folder:
-            # OAuth refresh tokens are required; this ensures env vars exist early.
             _require_dropbox_oauth()
 
-           all_paths = dropbox_list_mp4_paths(request.library_folder)
+            all_paths = dropbox_list_mp4_paths(request.library_folder)
 
-# Option B: randomize selection each run
-paths = list(all_paths)
-random.shuffle(paths)
-picked = paths[: min(request.library_count, len(paths))]
+            # Option B: randomize selection each run (no stable seed)
+            count = max(1, int(request.library_count))
+            paths = list(all_paths)
+            random.shuffle(paths)
+            picked = paths[: min(count, len(paths))]
 
             clean_paths: List[str] = []
             for i, p in enumerate(picked):
@@ -569,7 +561,7 @@ picked = paths[: min(request.library_count, len(paths))]
                 raw = os.path.join(tmpdir, f"lib_{i}.mp4")
                 clean = os.path.join(tmpdir, f"lib_{i}_clean.mp4")
                 download_file(link, raw)
-                normalize_clip_video_only(raw, clean)
+                normalize_clip_video_only(raw, clean)  # video-only
                 clean_paths.append(clean)
 
             joined = os.path.join(tmpdir, "library_joined_video_only.mp4")
@@ -610,8 +602,8 @@ picked = paths[: min(request.library_count, len(paths))]
             )
             vf_subs = f"subtitles={subs_path}:force_style='{style}'"
 
-        # STEP A: render VIDEO-ONLY (no audio)
-        vf_chain = []
+        # STEP A: render VIDEO-ONLY (explicitly no audio)
+        vf_chain: List[str] = []
         if vf_subs:
             vf_chain.append(vf_subs)
         vf_chain.append(f"scale={TARGET_W}:{TARGET_H}")
