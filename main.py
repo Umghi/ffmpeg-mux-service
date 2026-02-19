@@ -3,6 +3,9 @@ import uuid
 import shutil
 import tempfile
 import subprocess
+import time
+import base64
+import threading
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
@@ -31,9 +34,80 @@ TARGET_AR = 44100
 TARGET_AC = 2
 NARRATION_AB = "192k"
 
-DROPBOX_TOKEN = os.getenv("DROPBOX_TOKEN", "").strip()
-
 DEBUG_PROBES = os.getenv("DEBUG_PROBES", "0").strip() not in ("0", "false", "False")
+
+# ----------------------------
+# Dropbox OAuth (Refresh Token)
+# ----------------------------
+DROPBOX_APP_KEY = os.getenv("DROPBOX_APP_KEY", "").strip()
+DROPBOX_APP_SECRET = os.getenv("DROPBOX_APP_SECRET", "").strip()
+DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN", "").strip()
+
+_dbx_lock = threading.Lock()
+_dbx_access_token: Optional[str] = None
+_dbx_access_token_exp: float = 0.0  # unix seconds
+
+
+def _require_dropbox_oauth() -> None:
+    if not (DROPBOX_APP_KEY and DROPBOX_APP_SECRET and DROPBOX_REFRESH_TOKEN):
+        raise HTTPException(
+            status_code=500,
+            detail="Dropbox OAuth not configured. Set DROPBOX_APP_KEY, DROPBOX_APP_SECRET, DROPBOX_REFRESH_TOKEN.",
+        )
+
+
+def _refresh_dbx_access_token() -> None:
+    """
+    Exchange refresh_token -> short-lived access_token.
+    Cached in-memory; refresh 60s early to avoid edge expiry.
+    """
+    _require_dropbox_oauth()
+
+    token_url = "https://api.dropboxapi.com/oauth2/token"
+    basic = base64.b64encode(
+        f"{DROPBOX_APP_KEY}:{DROPBOX_APP_SECRET}".encode("utf-8")
+    ).decode("ascii")
+
+    r = requests.post(
+        token_url,
+        headers={"Authorization": f"Basic {basic}"},
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": DROPBOX_REFRESH_TOKEN,
+        },
+        timeout=30,
+    )
+
+    if r.status_code != 200:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Dropbox token refresh failed: {r.status_code} {r.text}",
+        )
+
+    payload = r.json()
+    access_token = payload.get("access_token")
+    expires_in = payload.get("expires_in")  # seconds
+
+    if not access_token:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Dropbox token refresh missing access_token: {payload}",
+        )
+
+    # Some responses include expires_in; if absent, be conservative.
+    ttl = int(expires_in) if expires_in else 1800
+
+    global _dbx_access_token, _dbx_access_token_exp
+    _dbx_access_token = access_token
+    _dbx_access_token_exp = time.time() + max(60, ttl - 60)
+
+
+def get_dbx_access_token() -> str:
+    with _dbx_lock:
+        if _dbx_access_token and time.time() < _dbx_access_token_exp:
+            return _dbx_access_token
+        _refresh_dbx_access_token()
+        return _dbx_access_token  # type: ignore
 
 
 # ----------------------------
@@ -92,7 +166,7 @@ def download_file(url: str, dest_path: str) -> None:
                         if _looks_like_html(chunk[:4096]):
                             raise HTTPException(
                                 status_code=400,
-                                detail="Downloaded HTML instead of media. Check link permissions / dl=1."
+                                detail="Downloaded HTML instead of media. Check link permissions / dl=1.",
                             )
 
                     total += len(chunk)
@@ -112,10 +186,9 @@ def download_file(url: str, dest_path: str) -> None:
 # Helpers: Dropbox library
 # ----------------------------
 def _dbx_headers() -> Dict[str, str]:
-    if not DROPBOX_TOKEN:
-        raise HTTPException(status_code=500, detail="DROPBOX_TOKEN not set")
+    token = get_dbx_access_token()
     return {
-        "Authorization": f"Bearer {DROPBOX_TOKEN}",
+        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
 
@@ -188,16 +261,20 @@ def ffprobe_streams(path: str) -> str:
     return subprocess.check_output(
         ["ffprobe", "-hide_banner", "-v", "error", "-show_streams", "-show_format", "-of", "json", path],
         stderr=subprocess.STDOUT,
-        timeout=30
+        timeout=30,
     ).decode(errors="ignore")
 
 
 def get_duration_seconds(path: str) -> float:
     cmd = [
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        path
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        path,
     ]
     try:
         out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=30).decode().strip()
@@ -212,19 +289,16 @@ def get_duration_seconds(path: str) -> float:
 
 
 def normalize_narration(src_audio: str, dst_m4a: str) -> None:
-    """
-    Normalize narration to a clean, compatible AAC-LC track:
-    - timestamps start at 0
-    - stereo 44.1k
-    - loudness normalized (prevents "it's there but quiet")
-    - sets correct MP4 audio handler
-    """
     cmd = [
-        "ffmpeg", "-y",
-        "-i", src_audio,
+        "ffmpeg",
+        "-y",
+        "-i",
+        src_audio,
         "-vn",
-        "-fflags", "+genpts",
-        "-avoid_negative_ts", "make_zero",
+        "-fflags",
+        "+genpts",
+        "-avoid_negative_ts",
+        "make_zero",
         "-af",
         (
             "asetpts=PTS-STARTPTS,"
@@ -232,40 +306,62 @@ def normalize_narration(src_audio: str, dst_m4a: str) -> None:
             "aformat=channel_layouts=stereo,"
             "loudnorm=I=-16:TP=-1.5:LRA=11"
         ),
-        "-ac", str(TARGET_AC),
-        "-ar", str(TARGET_AR),
-        "-c:a", "aac",
-        "-profile:a", "aac_low",
-        "-b:a", NARRATION_AB,
-        "-map_metadata", "-1",
-        "-metadata:s:a:0", "handler_name=SoundHandler",
-        "-metadata:s:a:0", "title=Narration",
-        "-movflags", "+faststart",
+        "-ac",
+        str(TARGET_AC),
+        "-ar",
+        str(TARGET_AR),
+        "-c:a",
+        "aac",
+        "-profile:a",
+        "aac_low",
+        "-b:a",
+        NARRATION_AB,
+        "-map_metadata",
+        "-1",
+        "-metadata:s:a:0",
+        "handler_name=SoundHandler",
+        "-metadata:s:a:0",
+        "title=Narration",
+        "-movflags",
+        "+faststart",
         dst_m4a,
     ]
     _run(cmd, timeout=FFMPEG_TIMEOUT)
 
 
 def normalize_clip_video_only(src_mp4: str, dst_mp4: str) -> None:
-    """
-    Normalize ONLY video (no audio) to be concat-safe.
-    """
     cmd = [
-        "ffmpeg", "-y",
-        "-i", src_mp4,
-        "-map", "0:v:0",
-        "-an", "-sn", "-dn",
-        "-map_metadata", "-1",
-        "-fflags", "+genpts",
-        "-avoid_negative_ts", "make_zero",
-        "-vf", f"scale={TARGET_W}:{TARGET_H},fps={TARGET_FPS},format={TARGET_PIXFMT}",
-        "-fps_mode", "cfr",
-        "-video_track_timescale", TARGET_TIMESCALE,
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-pix_fmt", TARGET_PIXFMT,
-        "-metadata:s:v:0", "handler_name=VideoHandler",
-        "-movflags", "+faststart",
+        "ffmpeg",
+        "-y",
+        "-i",
+        src_mp4,
+        "-map",
+        "0:v:0",
+        "-an",
+        "-sn",
+        "-dn",
+        "-map_metadata",
+        "-1",
+        "-fflags",
+        "+genpts",
+        "-avoid_negative_ts",
+        "make_zero",
+        "-vf",
+        f"scale={TARGET_W}:{TARGET_H},fps={TARGET_FPS},format={TARGET_PIXFMT}",
+        "-fps_mode",
+        "cfr",
+        "-video_track_timescale",
+        TARGET_TIMESCALE,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-pix_fmt",
+        TARGET_PIXFMT,
+        "-metadata:s:v:0",
+        "handler_name=VideoHandler",
+        "-movflags",
+        "+faststart",
         dst_mp4,
     ]
     _run(cmd, timeout=FFMPEG_TIMEOUT)
@@ -278,19 +374,31 @@ def concat_library_video_only(clean_paths: List[str], joined_out: str) -> None:
             f.write(f"file '{p}'\n")
 
     cmd = [
-        "ffmpeg", "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", list_path,
-        "-map_metadata", "-1",
-        "-fflags", "+genpts",
-        "-avoid_negative_ts", "make_zero",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-pix_fmt", TARGET_PIXFMT,
+        "ffmpeg",
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        list_path,
+        "-map_metadata",
+        "-1",
+        "-fflags",
+        "+genpts",
+        "-avoid_negative_ts",
+        "make_zero",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-pix_fmt",
+        TARGET_PIXFMT,
         "-an",
-        "-metadata:s:v:0", "handler_name=VideoHandler",
-        "-movflags", "+faststart",
+        "-metadata:s:v:0",
+        "handler_name=VideoHandler",
+        "-movflags",
+        "+faststart",
         joined_out,
     ]
     _run(cmd, timeout=FFMPEG_TIMEOUT)
@@ -423,13 +531,12 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
 
     subs_path = os.path.join(tmpdir, "subs.srt")
 
-    # Step outputs
     source_video_path = None
-    rendered_video_path = os.path.join(tmpdir, "video_only_render.mp4")  # loop + subs + trim, NO AUDIO
+    rendered_video_path = os.path.join(tmpdir, "video_only_render.mp4")
     output_path = os.path.join(tmpdir, "output.mp4")
 
     try:
-        # 1) Download + normalize narration (THIS is the only audio we will use)
+        # 1) Download + normalize narration (ONLY audio in final)
         download_file(str(request.audio_url), raw_audio_path)
         normalize_narration(raw_audio_path, narration_path)
 
@@ -445,8 +552,8 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
 
         # 4) Resolve video source (library or direct)
         if request.library_folder:
-            if not DROPBOX_TOKEN:
-                raise HTTPException(status_code=500, detail="library_folder used but DROPBOX_TOKEN is not set")
+            # OAuth refresh tokens are required; this ensures env vars exist early.
+            _require_dropbox_oauth()
 
             all_paths = dropbox_list_mp4_paths(request.library_folder)
             picked = stable_pick(all_paths, request.library_count, seed=str(request.audio_url))
@@ -457,7 +564,7 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
                 raw = os.path.join(tmpdir, f"lib_{i}.mp4")
                 clean = os.path.join(tmpdir, f"lib_{i}_clean.mp4")
                 download_file(link, raw)
-                normalize_clip_video_only(raw, clean)  # IMPORTANT: video-only
+                normalize_clip_video_only(raw, clean)
                 clean_paths.append(clean)
 
             joined = os.path.join(tmpdir, "library_joined_video_only.mp4")
@@ -498,10 +605,7 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
             )
             vf_subs = f"subtitles={subs_path}:force_style='{style}'"
 
-        # ----------------------------
-        # STEP A: render VIDEO-ONLY (explicitly no audio)
-        # ----------------------------
-        # Loop the video to narration length, apply subs, normalize scale/fps/pixfmt, strip audio.
+        # STEP A: render VIDEO-ONLY (no audio)
         vf_chain = []
         if vf_subs:
             vf_chain.append(vf_subs)
@@ -519,7 +623,7 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
             "-fflags", "+genpts",
             "-avoid_negative_ts", "make_zero",
             "-map", "0:v:0",
-            "-an",  # <- REMOVE ALL SOURCE AUDIO
+            "-an",
             "-vf", vf_final,
             "-fps_mode", "cfr",
             "-video_track_timescale", TARGET_TIMESCALE,
@@ -532,9 +636,7 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
         ]
         _run(step_a, timeout=FFMPEG_TIMEOUT)
 
-        # ----------------------------
-        # STEP B: mux narration as the ONLY audio
-        # ----------------------------
+        # STEP B: mux narration as ONLY audio
         step_b = [
             "ffmpeg", "-y",
             "-i", rendered_video_path,
