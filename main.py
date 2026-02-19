@@ -6,6 +6,7 @@ import subprocess
 import time
 import base64
 import threading
+import random
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
@@ -555,8 +556,12 @@ def mux(request: MuxRequest, background_tasks: BackgroundTasks):
             # OAuth refresh tokens are required; this ensures env vars exist early.
             _require_dropbox_oauth()
 
-            all_paths = dropbox_list_mp4_paths(request.library_folder)
-            picked = stable_pick(all_paths, request.library_count, seed=str(request.audio_url))
+           all_paths = dropbox_list_mp4_paths(request.library_folder)
+
+# Option B: randomize selection each run
+paths = list(all_paths)
+random.shuffle(paths)
+picked = paths[: min(request.library_count, len(paths))]
 
             clean_paths: List[str] = []
             for i, p in enumerate(picked):
